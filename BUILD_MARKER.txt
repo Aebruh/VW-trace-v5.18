@@ -1,1 +1,1 @@
-Triggers Android APK build for v0.8 post-center Shapely checkpoints and native fault logging.
+Triggers Android APK build for v0.9 rectangle creation/covers/intersection diagnostics.
