@@ -1,0 +1,272 @@
+        "region_id": region_id,
+        "z_rank": z_rank,
+        "area": area,
+        "fill_objects": len(rects),
+        "edge_objects": len(edge_rects),
+        "objects": len(rects) + len(edge_rects),
+        "edge_coverage": round(edge_ratio, 4),
+        "total_coverage": round(coverage_ratio, 4),
+        "detail_mode": area < 300,
+    }
+    return local_objects, stat, float(poly.area), float(coverage_ratio * poly.area)
+
+
+def vectorize(labels, colors, background,
+              base_vw_area=46.0,
+              min_region=1,
+              rotation_threshold=30.0,
+              safety_margin=0.03,
+              workers=4):
+    regions = []
+    for ci in range(len(colors)):
+        if ci == background:
+            continue
+        mask = (labels == ci).astype(np.uint8)
+        n, cc, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+        for j in range(1, n):
+            x, y, w, h, area = (int(v) for v in stats[j])
+            if area < min_region:
+                continue
+            component = cc[y:y + h, x:x + w] == j
+            regions.append((area, ci, x, y, component))
+
+    # Base masses first; tiny details later and therefore visually above them.
+    regions.sort(key=lambda r: r[0], reverse=True)
+    jobs = []
+    total = len(regions)
+    for region_id, (area, ci, ox, oy, component) in enumerate(regions):
+        # z rank increases toward smaller/detail regions.
+        z_rank = region_id
+        jobs.append((area, ci, ox, oy, component, base_vw_area,
+                     rotation_threshold, safety_margin, region_id, z_rank))
+
+    workers = max(1, int(workers))
+    if workers > 1 and len(jobs) > 1:
+        with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=6) as ex:
+            results = list(ex.map(process_region_job, jobs, chunksize=1))
+    else:
+        results = [process_region_job(j) for j in jobs]
+
+    objects = []
+    region_report = []
+    cage_area_sum = 0.0
+    covered_area_sum = 0.0
+    for result in results:
+        if result is None:
+            continue
+        local_objects, stat, poly_area, covered_area = result
+        objects.extend(local_objects)
+        region_report.append(stat)
+        cage_area_sum += poly_area
+        covered_area_sum += covered_area
+
+    return objects, {
+        "regions": len(regions),
+        "detail_regions": sum(r[0] < 300 for r in regions),
+        "cage_area": round(cage_area_sum, 2),
+        "covered_area": round(covered_area_sum, 2),
+        "coverage_ratio": round(covered_area_sum / max(1.0, cage_area_sum), 5),
+        "largest_region_stats": region_report[:25],
+    }
+
+# ---------------------------------------------------------------------------
+# Render / GMD export
+# ---------------------------------------------------------------------------
+
+def render(size, colors, objects, background, antialias=2):
+    w, h = size
+    f = max(1, int(antialias))
+    bg = tuple(int(v) for v in colors[background])
+    canvas = np.empty((h * f, w * f, 3), dtype=np.uint8)
+    canvas[:] = bg
+
+    for obj in objects:
+        color = tuple(int(v) for v in colors[obj["color"]])
+        cx, cy, rw, rh, angle = obj["rr"]
+        rect = ((float(cx * f), float(cy * f)),
+                (float(max(0.01, rw * f)), float(max(0.01, rh * f))),
+                float(angle))
+        corners = cv2.boxPoints(rect)
+        cv2.fillConvexPoly(canvas, np.rint(corners).astype(np.int32),
+                           color, lineType=cv2.LINE_AA)
+
+    if f > 1:
+        canvas = cv2.resize(canvas, (w, h), interpolation=cv2.INTER_AREA)
+    return Image.fromarray(canvas, "RGB")
+
+
+def weighted_error(reference: Image.Image, preview: Image.Image):
+    ref = np.asarray(reference.convert("RGB"), dtype=np.int16)
+    got = np.asarray(preview.convert("RGB"), dtype=np.int16)
+    edges = cv2.Canny(cv2.cvtColor(ref.astype(np.uint8), cv2.COLOR_RGB2GRAY), 50, 140)
+    weight = 1.0 + 2.0 * (cv2.dilate(edges, np.ones((3, 3), np.uint8)) > 0)
+    return float((np.abs(ref - got).mean(axis=2) * weight).mean())
+
+
+def background_gap_mask(labels, colors, background, preview, threshold=10.0):
+    rendered = np.asarray(preview.convert("RGB"), dtype=np.int16)
+    bg = colors[background].astype(np.int16)
+    near_bg = np.linalg.norm(rendered - bg, axis=2) < threshold
+    return (labels >= 0) & (labels != background) & near_bg
+
+
+def gmd_file(path, title, size, colors, objects,
+             gd_width, x_origin, y_origin, start_color):
+    factor = gd_width / size[0]
+    color_ids = [start_color + i for i in range(len(colors))]
+    definitions = "".join(
+        f"1_{int(c[0])}_2_{int(c[1])}_3_{int(c[2])}_4_-1_6_{color_ids[i]}_7_1_8_1_11_0_12_0_13_0_15_0_18_0|"
+        for i, c in enumerate(colors)
+    )
+    entries = ["kS38," + definitions + ";kA13,0;kA15,0;kA16,0;kA14,;"]
+
+    for index, obj in enumerate(objects):
+        cx, cy, rw, rh, rotation = obj["rr"]
+        sx = rw * factor / SQUARE_SIZE
+        sy = rh * factor / SQUARE_SIZE
+        gx = x_origin + cx * factor
+        gy = y_origin + (size[1] - cy) * factor
+        # Explicit source-region Z hierarchy. Smaller/detail regions have larger
+        # z_rank and sit above large base masses. Within a region: fill < edge.
+        role_offset = 2 if obj.get("role") == "vw_edge" else 1
+        z = min(int(obj.get("z_rank", 0)) * 3 + role_offset, 9999)
+        props = [
+            "1", str(SQUARE_ID),
+            "2", f"{gx:.5f}",
+            "3", f"{gy:.5f}",
+            "6", f"{float(rotation):.5f}",
+            "128", f"{sx:.7f}",
+            "129", f"{sy:.7f}",
+            "21", str(color_ids[obj["color"]]),
+            "22", str(color_ids[obj["color"]]),
+            "24", "3", "25", str(z), "20", "2",
+            "57", "1", "64", "1", "67", "1", "96", "1",
+            "116", "1", "121", "1",
+        ]
+        entries.append(",".join(props) + ";")
+
+    level = "".join(entries)
+    description = f"Fidelity-first VW vector tracer v5. {len(objects)} objects."
+    xml = (
+        f'<?xml version="1.0"?><plist version="1.0" gjver="2.0"><dict>'
+        f'<k>kCEK</k><i>4</i><k>k2</k><s>{escape(title)}</s>'
+        f'<k>k4</k><s>{escape(level)}</s>'
+        f'<k>k5</k><s>{escape(description)}</s>'
+        '<k>k13</k><t/><k>k21</k><i>2</i><k>k16</k><i>1</i>'
+        '</dict></plist>'
+    )
+    Path(path).write_text(xml, encoding="utf8")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("png", type=Path)
+    ap.add_argument("-o", "--output", type=Path)
+    ap.add_argument("--max-dimension", type=int, default=512)
+    ap.add_argument("--colors", type=int, default=25)
+    ap.add_argument("--vw-area", type=float, default=46.0)
+    ap.add_argument("--rotation-threshold", type=float, default=30.0)
+    ap.add_argument("--safety-margin", type=float, default=0.03)
+    ap.add_argument("--object-budget", type=int, default=0)
+    ap.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1))
+    ap.add_argument("--gd-width", type=float, default=800.0)
+    ap.add_argument("--x-origin", type=float, default=150.0)
+    ap.add_argument("--y-origin", type=float, default=150.0)
+    ap.add_argument("--start-color", type=int, default=940)
+    args = ap.parse_args()
+
+    source = Image.open(args.png).convert("RGBA")
+    scale = min(1.0, args.max_dimension / max(source.size))
+    size = tuple(max(1, int(round(v * scale))) for v in source.size)
+    work = source.resize(size, Image.Resampling.LANCZOS) if size != source.size else source
+
+    colors = stable_palette(source, args.colors)
+    labels, seeded = edge_aware_labels(work, colors, 4)
+    valid = labels[labels >= 0]
+    background = int(np.bincount(valid, minlength=len(colors)).argmax())
+
+    objects, vstats = vectorize(
+        labels, colors, background,
+        base_vw_area=args.vw_area,
+        rotation_threshold=args.rotation_threshold,
+        safety_margin=args.safety_margin,
+        workers=args.workers)
+
+    if args.object_budget > 0 and len(objects) > args.object_budget:
+        # Budget by visual value instead of generation order. Edge-band pieces get
+        # a strong bonus so the VW cage survives; fill pieces compete by actual
+        # newly-covered vector area. Small-region details receive a mild boost.
+        def object_value(o):
+            region = float(o.get("region_area", 1.0))
+            gain = float(o.get("gain", 0.25))
+            detail_boost = 1.0 + (0.45 if region < 500 else 0.20 if region < 1500 else 0.0)
+            role_boost = 4.0 if o.get("role") == "vw_edge" else 1.35 if o.get("role") == "detail_fill" else 1.0
+            return gain * detail_boost * role_boost
+        ranked = sorted(enumerate(objects), key=lambda it: object_value(it[1]), reverse=True)
+        keep_idx = {i for i, _ in ranked[:args.object_budget]}
+        objects = [o for i, o in enumerate(objects) if i in keep_idx]
+
+    preview = render(work.size, colors, objects, background, antialias=2)
+    err = weighted_error(work, preview)
+    gaps = int(np.count_nonzero(background_gap_mask(labels, colors, background, preview)))
+
+    out = args.output or args.png.with_name(args.png.stem + "_VW_VectorFill.gmd")
+    preview_path = out.with_name(out.stem + "_preview.png")
+    report_path = out.with_name(out.stem + "_report.json")
+    palette_path = out.with_name(out.stem + "_palette.json")
+
+    gmd_file(out, out.stem, work.size, colors, objects,
+             args.gd_width, args.x_origin, args.y_origin, args.start_color)
+    preview.save(preview_path)
+    palette_path.write_text(json.dumps({
+        "background_index": background,
+        "background_rgb": [int(v) for v in colors[background]],
+        "colors": [[int(v) for v in c] for c in colors],
+    }, indent=2), encoding="utf8")
+
+    report = {
+        "source": str(args.png),
+        "gmd": str(out),
+        "preview": str(preview_path),
+        "working_size": list(work.size),
+        "original_size": list(source.size),
+        "palette_colors": len(colors),
+        "background_omitted": True,
+        "background_rgb": [int(v) for v in colors[background]],
+        "objects": len(objects),
+        "rotated_rectangles": len(objects),
+        "fill_objects": sum(o.get("role") in ("fill", "detail_fill") for o in objects),
+        "detail_fill_objects": sum(o.get("role") == "detail_fill" for o in objects),
+        "vw_edge_objects": sum(o.get("role") == "vw_edge" for o in objects),
+        "vw_area": args.vw_area,
+        "rotation_threshold_degrees": args.rotation_threshold,
+        "safety_margin": args.safety_margin,
+        "workers": args.workers,
+        "weighted_error": round(float(err), 4),
+        "visible_gap_pixels": gaps,
+        "seeded_pixels_working_resolution": int(np.count_nonzero(seeded)),
+        **vstats,
+        "notes": [
+            "Fidelity-first v5 preserves all stable source colors and tiny connected detail regions.",
+            "Explicit region Z ranks place smaller detail regions above large base masses; VW edge sits above fill within each region.",
+            "VW polygon is retained as a hard vector cage and rendered as an inward boundary band.",
+            "VW simplification is curvature-adaptive: curved sections use a much lower local threshold than straight sections.",
+            "A dynamic chord-deviation guard reinserts points when a straight VW chord would cut across a curve.",
+            "Fill rotation threshold is dynamic: low on curved residual geometry and high on straight geometry.",
+            "VW edge cubes are adaptively merged on straight runs and split quickly on curved runs, reducing object count without changing the cage.",
+            "No raster/grid packing is used after contour extraction.",
+            "VW edge band is counted as existing coverage before interior filling begins.",
+            "Remaining polygon slivers are patched by a vector-only residual cleanup pass.",
+            "Large rotated rectangles grow until the safety-inset VW cage stops them.",
+            "Rectangle orientation persists until the residual direction changes past the rotation threshold.",
+            "Fill centers are sampled continuously along residual principal axes; no raster grid is used.",
+            "Rectangle width and height are optimized independently instead of using only fixed aspect ratios.",
+            "Overlap between fill rectangles is allowed and encouraged.",
+        ],
+    }
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf8")
+    print(json.dumps(report, indent=2))
+
+
+if __name__ == "__main__":
+    main()
