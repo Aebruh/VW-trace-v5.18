@@ -97,13 +97,13 @@ def install_android_vectorize(namespace: dict) -> None:
         for region_id in range(total_regions):
             area, ci, ox, oy, w, h, packed = regions[region_id]
 
-            # Force collection before the next GEOS-heavy region. This is slower
-            # than desktop mode but keeps Android peak memory predictable.
             gc.collect()
-            _progress(
+            region_context = (
                 f'vectorizing region {region_id + 1}/{total_regions} '
                 f'(area {area}, size {w}x{h}, color {ci})'
             )
+            os.environ['GDVW_REGION_CONTEXT'] = region_context
+            _progress(region_context)
 
             bits = np.frombuffer(packed, dtype=np.uint8)
             component = np.unpackbits(bits, count=w * h).reshape((h, w)).astype(np.bool_, copy=False)
@@ -126,6 +126,7 @@ def install_android_vectorize(namespace: dict) -> None:
             del component, bits, packed, job, result
             gc.collect()
 
+        os.environ.pop('GDVW_REGION_CONTEXT', None)
         _progress(f'vectorization complete ({total_regions} regions)')
         return objects, {
             "regions": total_regions,
