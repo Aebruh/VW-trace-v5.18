@@ -1,0 +1,300 @@
+    This is the anti-triangle guard: straight runs can have long chords, while a
+    curved arc is forced to retain enough vertices that its polygon follows the
+    source curvature.
+    """
+    p = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    n = len(p)
+    kept = set(int(i) for i in np.asarray(kept_indices).reshape(-1))
+    if n <= 4:
+        idx = np.array(sorted(kept), dtype=np.int32)
+        return p[idx], idx
+
+    def arc_indices(i0, i1):
+        if i1 > i0:
+            return np.arange(i0 + 1, i1, dtype=np.int32)
+        return np.concatenate((np.arange(i0 + 1, n, dtype=np.int32),
+                               np.arange(0, i1, dtype=np.int32)))
+
+    # A few refinement passes are enough because each split shortens a bad chord.
+    for _ in range(10):
+        order = sorted(kept)
+        additions = []
+        m = len(order)
+        for k in range(m):
+            i0 = order[k]
+            i1 = order[(k + 1) % m]
+            arc = arc_indices(i0, i1)
+            if len(arc) == 0:
+                continue
+            a, b = p[i0], p[i1]
+            chord_len = float(np.linalg.norm(b - a))
+            local_curve = float(np.percentile(curvature_scores[arc], 78)) if len(arc) else 0.0
+            max_dev = straight_max_deviation * (1.0 - local_curve) + curved_max_deviation * local_curve
+            max_chord = straight_max_chord * (1.0 - local_curve) + curved_max_chord * local_curve
+            d = _point_segment_distances(p[arc], a, b)
+            max_pos = int(np.argmax(d))
+            max_d = float(d[max_pos])
+            if max_d > max_dev or chord_len > max_chord:
+                if max_d > max_dev * 0.72:
+                    candidate = int(arc[max_pos])
+                else:
+                    candidate = int(arc[len(arc) // 2])
+                additions.append(candidate)
+        if not additions:
+            break
+        kept.update(additions)
+
+    idx = np.asarray(sorted(kept), dtype=np.int32)
+    return p[idx], idx
+
+
+def adaptive_vw_contour(points: np.ndarray, base_area_limit: float):
+    """Dynamic VW + chord guard used to build the actual cage."""
+    p = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    curvature = contour_curvature_scores(p)
+    _, idx = vw_simplify_dynamic(p, base_area_limit, curvature,
+                                 curved_limit_factor=0.09)
+    out, idx = enforce_dynamic_chord_guard(
+        p, idx, curvature,
+        straight_max_deviation=2.8,
+        curved_max_deviation=0.68,
+        straight_max_chord=80.0,
+        curved_max_chord=10.0)
+    return out, curvature, idx
+
+def light_contour_smooth(pts: np.ndarray) -> np.ndarray:
+    if len(pts) < 5:
+        return pts.astype(np.float64)
+    p = pts.astype(np.float64)
+    prev = np.roll(p, 1, axis=0)
+    nxt = np.roll(p, -1, axis=0)
+    sm = 0.20 * prev + 0.60 * p + 0.20 * nxt
+
+    # Preserve real corners rather than rounding everything.
+    v1 = p - prev
+    v2 = nxt - p
+    n1 = np.linalg.norm(v1, axis=1)
+    n2 = np.linalg.norm(v2, axis=1)
+    good = (n1 > 1e-6) & (n2 > 1e-6)
+    angle = np.zeros(len(p), dtype=np.float64)
+    dots = np.sum(v1[good] * v2[good], axis=1) / (n1[good] * n2[good])
+    angle[good] = np.degrees(np.arccos(np.clip(dots, -1.0, 1.0)))
+    sm[angle > 42.0] = p[angle > 42.0]
+    return sm
+
+
+def largest_polygon_piece(geom):
+    if geom is None or geom.is_empty:
+        return None
+    if geom.geom_type == "Polygon":
+        return geom if geom.area > 0 else None
+    polys = [g for g in getattr(geom, "geoms", [])
+             if g.geom_type == "Polygon" and g.area > 0]
+    return max(polys, key=lambda g: g.area) if polys else None
+
+
+def build_region_polygon(component: np.ndarray, base_vw_area: float):
+    contours, hierarchy = cv2.findContours(component.astype(np.uint8),
+                                           cv2.RETR_CCOMP,
+                                           cv2.CHAIN_APPROX_NONE)
+    if hierarchy is None or not contours:
+        return None
+    hierarchy = hierarchy[0]
+    area = float(np.count_nonzero(component))
+
+    # Keep small regions more detailed while large regions use the higher VW threshold.
+    detail_factor = 1.0 + (area < 1000) * 0.30 + (area < 220) * 0.35
+    vw_area = max(8.0, base_vw_area / detail_factor)
+
+    simplified = []
+    for idx, contour in enumerate(contours):
+        raw = contour.reshape(-1, 2)
+        if len(raw) < 3:
+            continue
+        smoothed = light_contour_smooth(raw)
+        pts, _curve, _idx = adaptive_vw_contour(smoothed, vw_area)
+        if len(pts) >= 3:
+            simplified.append((idx, pts, int(hierarchy[idx][3])))
+
+    lookup = {idx: pts for idx, pts, _ in simplified}
+    exteriors = []
+    holes = {}
+    for idx, pts, parent in simplified:
+        if parent < 0:
+            exteriors.append(idx)
+            holes[idx] = []
+    for idx, pts, parent in simplified:
+        if parent >= 0 and parent in holes:
+            holes[parent].append(pts)
+
+    polys = []
+    for idx in exteriors:
+        try:
+            poly = Polygon(lookup[idx], holes=[h for h in holes[idx] if len(h) >= 3]).buffer(0)
+        except Exception:
+            continue
+        if not poly.is_empty and poly.area > 0:
+            polys.append(poly)
+
+    if not polys:
+        return None
+    return largest_polygon_piece(unary_union(polys).buffer(0))
+
+# ---------------------------------------------------------------------------
+# Human-style vector filling
+# ---------------------------------------------------------------------------
+
+def rect_polygon(cx, cy, width, height, angle_deg):
+    r = box(-width / 2.0, -height / 2.0,
+            width / 2.0, height / 2.0)
+    r = affinity.rotate(r, angle_deg, origin=(0, 0), use_radians=False)
+    return affinity.translate(r, xoff=cx, yoff=cy)
+
+
+def rectangle_dimensions_and_angle(poly: Polygon):
+    mrr = poly.minimum_rotated_rectangle
+    coords = list(mrr.exterior.coords)[:4]
+    edges = []
+    for a, b in zip(coords, coords[1:] + coords[:1]):
+        dx = b[0] - a[0]
+        dy = b[1] - a[1]
+        edges.append((math.hypot(dx, dy), math.degrees(math.atan2(dy, dx))))
+    edges.sort(reverse=True, key=lambda t: t[0])
+    long_len, long_angle = edges[0]
+    short_len = edges[-1][0]
+    return max(long_len, 1e-6), max(short_len, 1e-6), long_angle
+
+
+def angle_delta(a, b):
+    d = abs((a - b) % 180.0)
+    return min(d, 180.0 - d)
+
+
+def normalize_angle(a):
+    return ((a + 90.0) % 180.0) - 90.0
+
+
+def polygon_curvature_score(poly: Polygon) -> float:
+    """0=mostly straight/boxy, 1=strongly curved/bendy boundary."""
+    if poly is None or poly.is_empty:
+        return 0.0
+    pts = np.asarray(poly.exterior.coords[:-1], dtype=np.float64)
+    if len(pts) < 4:
+        return 0.0
+    score = contour_curvature_scores(pts, window=max(2, min(4, len(pts)//6)))
+    # A high percentile reacts to a local bend without letting one tiny corner dominate.
+    return float(np.clip(np.percentile(score, 72), 0.0, 1.0))
+
+
+def dynamic_rotation_threshold(piece: Polygon, base_threshold: float) -> float:
+    """High threshold on straight residuals, low threshold on curved residuals."""
+    c = polygon_curvature_score(piece)
+    straight = max(base_threshold, 40.0)
+    curved = min(11.0, base_threshold * 0.34)
+    return float(straight * (1.0 - c) + curved * c)
+
+
+def choose_orientations(piece: Polygon, previous_angle,
+                        rotation_threshold: float):
+    long_len, short_len, base = rectangle_dimensions_and_angle(piece)
+    base = normalize_angle(base)
+
+    # Important: keep the previous direction unless the residual really bends.
+    if previous_angle is not None and angle_delta(base, previous_angle) < rotation_threshold:
+        return [previous_angle, base]
+
+    # A real turn: try the new dominant direction and one small correction only.
+    return [base, normalize_angle(base + 12.0), normalize_angle(base - 12.0)]
+
+
+def choose_aspects(piece: Polygon):
+    long_len, short_len, _ = rectangle_dimensions_and_angle(piece)
+    ratio = float(np.clip(long_len / max(short_len, 1e-6), 1.0, 14.0))
+    # Always include broad blocks as well as the MRR-like long strip. This is
+    # closer to manual filling: use the biggest useful block, not only a shape
+    # with the same aspect as the whole residual.
+    vals = [ratio, max(1.0, ratio * 0.62), 6.0, 3.0, 1.6, 1.0]
+    out = []
+    for v in vals:
+        v = float(np.clip(v, 1.0, 14.0))
+        if all(abs(v - old) > 0.22 for old in out):
+            out.append(v)
+    return out[:5]
+
+
+def grow_inscribed_rectangle(safe_cage: Polygon, safe_prepared,
+                             target_piece: Polygon,
+                             center, angle, aspect,
+                             binary_steps=9):
+    minx, miny, maxx, maxy = target_piece.bounds
+    span = max(maxx - minx, maxy - miny) + 1.0
+    low, high = 0.25, span
+    best = None
+
+    for _ in range(binary_steps):
+        s = (low + high) / 2.0
+        width = s * aspect
+        height = s
+        rect = rect_polygon(center[0], center[1], width, height, angle)
+        if safe_prepared.covers(rect):
+            best = rect
+            low = s
+        else:
+            high = s
+
+    if best is None:
+        return None
+    gain = best.intersection(target_piece).area
+    if gain <= 0:
+        return None
+    return best, gain
+
+
+def decode_rect(rect: Polygon):
+    width, height, angle = rectangle_dimensions_and_angle(rect)
+    c = rect.centroid
+    return c.x, c.y, width, height, normalize_angle(angle)
+
+
+
+def piece_candidate_centers(piece: Polygon, safe_cage: Polygon, limit: int = 7):
+    """Vector-only center seeds distributed through a residual polygon.
+
+    This intentionally mimics manual filling: don't keep dropping rectangles at
+    one medial point; try several broad locations along the piece's dominant
+    axes and let large rectangles overlap.
+    """
+    centers = []
+    try:
+        mic = maximum_inscribed_circle(piece, tolerance=max(0.08, math.sqrt(piece.area) * 0.006))
+        mc = list(mic.coords)[0]
+        centers.append((float(mc[0]), float(mc[1])))
+    except Exception:
+        pass
+    rp = piece.representative_point()
+    centers.append((rp.x, rp.y))
+    if piece.covers(piece.centroid):
+        centers.append((piece.centroid.x, piece.centroid.y))
+
+    # Sample around the minimum-rotated-rectangle axes. This is not a raster
+    # grid: these are a handful of continuous vector seed points.
+    mrr = piece.minimum_rotated_rectangle
+    coords = list(mrr.exterior.coords)[:4]
+    if len(coords) == 4:
+        # Find long and short edge vectors.
+        edges = []
+        for a, b in zip(coords, coords[1:] + coords[:1]):
+            vx, vy = b[0] - a[0], b[1] - a[1]
+            L = math.hypot(vx, vy)
+            if L > 1e-8:
+                edges.append((L, vx / L, vy / L))
+        edges.sort(reverse=True, key=lambda x: x[0])
+        if len(edges) >= 2:
+            long_len, ux, uy = edges[0]
+            # perpendicular axis is more stable than relying on duplicated MRR edges
+            vx, vy = -uy, ux
+            c = piece.centroid if piece.covers(piece.centroid) else rp
+            cx, cy = c.x, c.y
+            for frac in (-0.28, 0.28):
+                centers.append((cx + ux * long_len * frac, cy + uy * long_len * frac))
+            short_len = min(e[0] for e in edges)
