@@ -34,15 +34,19 @@ def main():
   return unary_union([Polygon(p.exterior) for p in (g.geoms if hasattr(g,'geoms') else [g])])
  outer_difference=shell(original_union).symmetric_difference(shell(new_union)).area
  assert missing<1e-5 and outer_difference<1e-5,(missing,spill,outer_difference)
- source_scale=2048/size[0]
- def render_full(items):
-  scaled=[dict(o,rr=[float(v)*source_scale if k<4 else float(v) for k,v in enumerate(o['rr'])]) for o in items]
-  return v5.render((2048,round(size[1]*source_scale)),colors,scaled,bg,2)
- image=render_full(decoded);base=render_full(reference);image.save(args.output_dir/(args.name+'_full.png'));image.resize((1024,round(size[1]*1024/size[0])),Image.Resampling.LANCZOS).save(args.output_dir/(args.name+'_preview.png'))
- a=np.asarray(base,dtype=np.int16);b=np.asarray(image,dtype=np.int16);fg=np.linalg.norm(a-colors[bg],axis=2)>20;diff=np.abs(a-b);protected=np.zeros(fg.shape,bool)
+ # Android memory-safe validation. Quality-mode geometry has already been
+ # selected; validation at 512px avoids a large 2048px temporary allocation.
+ def render_at(items,width):
+  scale=width/size[0]
+  scaled=[dict(o,rr=[float(v)*scale if k<4 else float(v) for k,v in enumerate(o['rr'])]) for o in items]
+  return v5.render((width,round(size[1]*scale)),colors,scaled,bg,2)
+ image=render_at(decoded,512);base=render_at(reference,512)
+ a=np.asarray(base,dtype=np.int16);b=np.asarray(image,dtype=np.int16);bgc=colors[bg].astype(np.int16);fg=np.max(np.abs(a-bgc),axis=2)>20;diff=np.abs(a-b);protected=np.zeros(fg.shape,bool)
  for x0,y0,x1,y1 in profile.get('protected_boxes_normalized',[]):protected[round(y0*fg.shape[0]):round(y1*fg.shape[0]),round(x0*fg.shape[1]):round(x1*fg.shape[1])]=True
  if args.protection:
   mask=np.load(args.protection).astype(bool);protected|=np.asarray(Image.fromarray(mask).resize((image.width,image.height),Image.Resampling.NEAREST)).astype(bool)
- report={'outer_silhouette_symmetric_difference':outer_difference,'repaired_enclosed_area':spill,'baseline_roles':dict(Counter(o.get('role','') for o in reference)),'baseline_objects':len(reference),'objects':len(objs),'reduction_percent':round(100*(len(reference)-len(objs))/len(reference),2),'lost_foreground_area_working_pixels':missing,'added_foreground_area_working_pixels':spill,'export_max_corner_error_working_pixels':corner_error,'foreground_rgb_mae_0_to_255':float(diff[fg].mean()),'protected_roi_rgb_mae_0_to_255':float(diff[protected].mean()) if protected.any() else None,'max_gd_z':len(objs)-1,'role_counts':dict(Counter(o.get('role','') for o in objs)),'in_game_verified':False,'limitations':'Preserves the outer silhouette and foreground coverage; audited enclosed seams may be filled. Internal colour boundaries may shift within the profile tolerance. Offline preview is not a GD renderer.'}
+ report={'outer_silhouette_symmetric_difference':outer_difference,'repaired_enclosed_area':spill,'baseline_roles':dict(Counter(o.get('role','') for o in reference)),'baseline_objects':len(reference),'objects':len(objs),'reduction_percent':round(100*(len(reference)-len(objs))/len(reference),2),'lost_foreground_area_working_pixels':missing,'added_foreground_area_working_pixels':spill,'export_max_corner_error_working_pixels':corner_error,'foreground_rgb_mae_0_to_255':float(diff[fg].mean()) if fg.any() else 0.0,'protected_roi_rgb_mae_0_to_255':float(diff[protected].mean()) if protected.any() else None,'max_gd_z':len(objs)-1,'role_counts':dict(Counter(o.get('role','') for o in objs)),'in_game_verified':False,'limitations':'Android memory-safe validation at 512px. Geometry/export is unchanged. Offline preview is not a GD renderer.','mobile_validation_width':512}
+ image.save(args.output_dir/(args.name+'_normal.png'));del a,b,fg,diff,protected
+ preview=render_at(decoded,1024);preview.save(args.output_dir/(args.name+'_preview.png'));preview.close();image.close();base.close()
  (args.output_dir/(args.name+'_report.json')).write_text(json.dumps(report,indent=2));print(json.dumps(report,indent=2))
 if __name__=='__main__':main()
