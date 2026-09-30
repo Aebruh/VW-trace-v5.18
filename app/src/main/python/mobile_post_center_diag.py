@@ -7,9 +7,13 @@ adds persistent checkpoints before/after each Shapely/GEOS operation. No scoring
 limits, fractions or candidate ordering are changed.
 """
 
+import faulthandler
 import math
 import os
 from pathlib import Path
+
+_FAULT_HANDLE = None
+_FAULT_ENABLED = False
 
 
 def _rss_mb():
@@ -22,10 +26,27 @@ def _rss_mb():
     return None
 
 
+def _ensure_fault_log():
+    global _FAULT_HANDLE, _FAULT_ENABLED
+    if _FAULT_ENABLED:
+        return
+    stage_path = os.environ.get('GDVW_STAGE_FILE')
+    if not stage_path:
+        return
+    try:
+        log_path = Path(stage_path).with_name('native_crash.log')
+        _FAULT_HANDLE = open(log_path, 'a', encoding='utf8', buffering=1)
+        faulthandler.enable(file=_FAULT_HANDLE, all_threads=True)
+        _FAULT_ENABLED = True
+    except Exception:
+        pass
+
+
 def _progress(stage: str):
     path = os.environ.get('GDVW_STAGE_FILE')
     if not path:
         return
+    _ensure_fault_log()
     try:
         ctx = os.environ.get('GDVW_REGION_CONTEXT', '').strip()
         label = f'{ctx} — {stage}' if ctx else stage
@@ -33,6 +54,9 @@ def _progress(stage: str):
         if rss is not None:
             label += f' [RAM {rss} MB]'
         Path(path).write_text(label, encoding='utf8')
+        if _FAULT_HANDLE is not None:
+            _FAULT_HANDLE.write(label + '\n')
+            _FAULT_HANDLE.flush()
     except Exception:
         pass
 
