@@ -1,6 +1,6 @@
 {
   "reference_width": 512,
-  "evaluation_scale": 4,
+  "evaluation_scale": 2,
   "protect_component_area": 20,
   "protect_thin_radius": 0.3,
   "seam_max_area": 0.1,
