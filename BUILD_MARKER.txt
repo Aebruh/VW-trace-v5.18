@@ -1,1 +1,1 @@
-Triggers Android APK build for v0.4 lazy-optimizer and per-region diagnostics release.
+Triggers Android APK build for v0.5 low-allocation GEOS rectangle path and deep region diagnostics.
