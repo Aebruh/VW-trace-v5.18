@@ -1,1 +1,1 @@
-Triggers Android APK build for v0.3 streamed-vectorizer crash-fix release.
+Triggers Android APK build for v0.4 lazy-optimizer and per-region diagnostics release.
