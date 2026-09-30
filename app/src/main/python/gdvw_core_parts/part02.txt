@@ -1,0 +1,300 @@
+            for frac in (-0.24, 0.24):
+                centers.append((cx + vx * short_len * frac, cy + vy * short_len * frac))
+
+    unique = []
+    for x, y in centers:
+        pt = Point(float(x), float(y))
+        if not safe_cage.covers(pt):
+            continue
+        if all(math.hypot(x - q[0], y - q[1]) > 0.65 for q in unique):
+            unique.append((float(x), float(y)))
+    return unique[:limit]
+
+
+def grow_inscribed_rectangle_free(safe_cage: Polygon, safe_prepared,
+                                   target_piece: Polygon,
+                                   center, angle,
+                                   binary_steps: int = 8,
+                                   height_samples: int = 7):
+    """Find a large rectangle without forcing a preset aspect ratio.
+
+    Width and height are searched independently. This is much closer to the
+    manual workflow where a square is scaled in X/Y until its sides approach the
+    outline, rather than scaling a fixed-aspect strip uniformly.
+    """
+    cx, cy = center
+    # Rotate target around this center so the candidate rectangle becomes axis aligned.
+    local_target = affinity.rotate(target_piece, -angle, origin=(cx, cy), use_radians=False)
+    minx, miny, maxx, maxy = local_target.bounds
+    max_half_w = max(0.15, max(abs(maxx - cx), abs(cx - minx)))
+    max_half_h = max(0.15, max(abs(maxy - cy), abs(cy - miny)))
+
+    # Broad-to-tall possibilities. Extra low fractions are useful for thin residual slivers.
+    fracs = np.linspace(0.16, 1.0, height_samples)
+    best = None
+    for frac in fracs:
+        half_h = max(0.12, max_half_h * float(frac))
+        low, high = 0.12, max_half_w
+        best_rect = None
+        for _ in range(binary_steps):
+            half_w = (low + high) / 2.0
+            local = box(cx - half_w, cy - half_h, cx + half_w, cy + half_h)
+            rect = affinity.rotate(local, angle, origin=(cx, cy), use_radians=False)
+            if safe_prepared.covers(rect):
+                best_rect = rect
+                low = half_w
+            else:
+                high = half_w
+        if best_rect is None:
+            continue
+        gain = best_rect.intersection(target_piece).area
+        # New coverage dominates. A small area reward favours broad overlapping masses.
+        score = gain + 0.035 * best_rect.area
+        if best is None or score > best[0]:
+            best = (score, best_rect, gain)
+
+    # Repeat with the local axes swapped. This catches tall blocks that the first
+    # pass may miss without requiring many hand-picked aspect ratios.
+    for frac in np.linspace(0.16, 1.0, max(4, height_samples - 2)):
+        half_w = max(0.12, max_half_w * float(frac))
+        low, high = 0.12, max_half_h
+        best_rect = None
+        for _ in range(binary_steps):
+            half_h = (low + high) / 2.0
+            local = box(cx - half_w, cy - half_h, cx + half_w, cy + half_h)
+            rect = affinity.rotate(local, angle, origin=(cx, cy), use_radians=False)
+            if safe_prepared.covers(rect):
+                best_rect = rect
+                low = half_h
+            else:
+                high = half_h
+        if best_rect is None:
+            continue
+        gain = best_rect.intersection(target_piece).area
+        score = gain + 0.035 * best_rect.area
+        if best is None or score > best[0]:
+            best = (score, best_rect, gain)
+
+    if best is None or best[2] <= 0:
+        return None
+    return best[1], best[2]
+
+
+def local_budget(area_hint: int):
+    if area_hint < 18:
+        return 1
+    if area_hint < 70:
+        return 2
+    if area_hint < 220:
+        return 5
+    if area_hint < 600:
+        return 9
+    if area_hint < 1500:
+        return 15
+    if area_hint < 3500:
+        return 26
+    return 36
+
+
+def fit_region(cage: Polygon, area_hint: int,
+               rotation_threshold=32.0,
+               safety_margin=0.04,
+               initial_coverage=None):
+    if cage is None or cage.is_empty or cage.area <= 0:
+        return [], 0.0, 0.0, []
+
+    # A very small inset provides numerical safety but allows the fill to tuck
+    # underneath the inward VW edge band. The hard rule remains: never cross cage.
+    safe_cage = cage.buffer(-safety_margin, join_style=2)
+    if safe_cage.is_empty:
+        safe_cage = cage
+    safe_cage = largest_polygon_piece(safe_cage)
+    if safe_cage is None:
+        return [], 0.0, 0.0, []
+    safe_prepared = prep(safe_cage)
+
+    total_area = cage.area
+    if initial_coverage is not None and not initial_coverage.is_empty:
+        initial_coverage = initial_coverage.intersection(cage).buffer(0)
+        raw_residual = cage.difference(initial_coverage).buffer(0)
+        residual = raw_residual.intersection(safe_cage).buffer(0)
+        initial_covered_area = total_area - raw_residual.area
+    else:
+        residual = safe_cage.buffer(0)
+        initial_covered_area = total_area - safe_cage.area
+
+    rectangles = []
+    gains = []
+    previous_angle = None
+    max_objects = local_budget(area_hint)
+    # Slightly higher budgets on big regions, but each object now covers more area.
+    if area_hint >= 3500:
+        max_objects += 8
+    elif area_hint >= 1200:
+        max_objects += 4
+
+    stop_ratio = 0.004 if area_hint >= 1200 else 0.012 if area_hint >= 300 else 0.028
+    min_gain = 1.0 if area_hint < 100 else 2.1 if area_hint < 400 else 3.4
+
+    for _ in range(max_objects):
+        # Consider the two largest disconnected residual pieces instead of only
+        # the largest; this avoids abandoning useful pockets around concavities.
+        pieces = []
+        if residual.geom_type == 'Polygon':
+            pieces = [residual]
+        else:
+            pieces = sorted(
+                [g for g in getattr(residual, 'geoms', [])
+                 if g.geom_type == 'Polygon' and g.area > 0],
+                key=lambda g: g.area, reverse=True)[:2]
+        if not pieces or pieces[0].area <= total_area * stop_ratio:
+            break
+
+        best = None
+        for piece in pieces:
+            if piece.area <= max(0.5, total_area * stop_ratio * 0.35):
+                continue
+            local_rotation_threshold = dynamic_rotation_threshold(piece, rotation_threshold)
+            angles = choose_orientations(piece, previous_angle, local_rotation_threshold)
+            # Add a perpendicular orientation for broad residual masses only.
+            long_len, short_len, base_angle = rectangle_dimensions_and_angle(piece)
+            if short_len > 0 and long_len / max(short_len, 1e-6) < 2.2:
+                angles.append(normalize_angle(base_angle + 90.0))
+            # dedupe angles
+            uniq_angles = []
+            for a in angles:
+                a = normalize_angle(a)
+                if all(angle_delta(a, q) > 3.0 for q in uniq_angles):
+                    uniq_angles.append(a)
+
+            centers = piece_candidate_centers(piece, safe_cage, limit=7)
+            for center in centers:
+                for angle in uniq_angles[:4]:
+                    fit = grow_inscribed_rectangle_free(
+                        safe_cage, safe_prepared, piece, center, angle,
+                        binary_steps=8, height_samples=7)
+                    if fit is None:
+                        continue
+                    rect, gain = fit
+                    # Reward useful new area heavily; modestly reward large overlap.
+                    score = gain + 0.030 * rect.area
+                    if best is None or score > best[0]:
+                        best = (score, rect, gain, angle)
+
+        if best is None or best[2] < min_gain:
+            break
+
+        rect = best[1]
+        rectangles.append(decode_rect(rect))
+        gains.append(float(best[2]))
+        previous_angle = best[3]
+        residual = residual.difference(rect).buffer(0)
+        if residual.is_empty:
+            break
+
+    covered = max(0.0, total_area - residual.area)
+    return (rectangles,
+            covered / max(1.0, total_area),
+            initial_covered_area / max(1.0, total_area),
+            gains)
+
+
+def fit_region_small(cage: Polygon, area_hint: int,
+                     rotation_threshold=32.0,
+                     safety_margin=0.03,
+                     initial_coverage=None):
+    """Low-cost vector fill for small regions.
+
+    Small details should not spend dozens of expensive candidate searches. The
+    VW edge band already covers much of them, so use only a few large inscribed
+    blocks in the remaining safe interior.
+    """
+    if cage is None or cage.is_empty or cage.area <= 0:
+        return [], 0.0, 0.0, []
+    safe = cage.buffer(-safety_margin, join_style=2)
+    if safe.is_empty:
+        safe = cage
+    safe = largest_polygon_piece(safe)
+    if safe is None:
+        return [], 0.0, 0.0, []
+    prepared = prep(safe)
+    total = cage.area
+    if initial_coverage is not None and not initial_coverage.is_empty:
+        initial_coverage = initial_coverage.intersection(cage).buffer(0)
+        raw_residual = cage.difference(initial_coverage).buffer(0)
+        residual = raw_residual.intersection(safe).buffer(0)
+        edge_ratio = (total - raw_residual.area) / max(1.0, total)
+    else:
+        residual = safe.buffer(0)
+        edge_ratio = max(0.0, (total - safe.area) / max(1.0, total))
+
+    budget = 1 if area_hint < 45 else 2 if area_hint < 110 else 3 if area_hint < 220 else 5
+    rects, gains = [], []
+    prev = None
+    for _ in range(budget):
+        piece = largest_polygon_piece(residual)
+        if piece is None or piece.area < 0.8:
+            break
+        try:
+            mic = maximum_inscribed_circle(piece, tolerance=max(0.05, math.sqrt(piece.area) * 0.008))
+            q = list(mic.coords)[0]
+            centers = [(float(q[0]), float(q[1]))]
+        except Exception:
+            rp = piece.representative_point()
+            centers = [(rp.x, rp.y)]
+        if piece.covers(piece.centroid):
+            centers.append((piece.centroid.x, piece.centroid.y))
+
+        local_rot = dynamic_rotation_threshold(piece, rotation_threshold)
+        angles = choose_orientations(piece, prev, local_rot)[:2]
+        aspects = choose_aspects(piece)[:3]
+        best = None
+        for center in centers[:2]:
+            for angle in angles:
+                for aspect in aspects:
+                    fit = grow_inscribed_rectangle(safe, prepared, piece,
+                                                   center, angle, aspect,
+                                                   binary_steps=7)
+                    if fit is None:
+                        continue
+                    rect, gain = fit
+                    score = gain + 0.02 * rect.area
+                    if best is None or score > best[0]:
+                        best = (score, rect, gain, angle)
+        if best is None or best[2] < 0.45:
+            break
+        rect = best[1]
+        rects.append(decode_rect(rect))
+        gains.append(float(best[2]))
+        prev = best[3]
+        residual = residual.difference(rect).buffer(0)
+        if residual.is_empty:
+            break
+    coverage = max(0.0, total - residual.area) / max(1.0, total)
+    return rects, coverage, edge_ratio, gains
+
+
+
+def adaptive_edge_spans(ring_coords):
+    """Compress straight VW runs into long edge strips, retain short strips on curves.
+
+    The merge threshold itself is curvature dependent: straight sections tolerate
+    a much larger direction change before a new cube/rectangle is needed, while
+    curved sections split quickly. This changes only the edge *objects*; the VW
+    polygon cage remains untouched.
+    """
+    pts = np.asarray(list(ring_coords), dtype=np.float64)
+    if len(pts) > 1 and np.linalg.norm(pts[0] - pts[-1]) < 1e-8:
+        pts = pts[:-1]
+    n = len(pts)
+    if n < 2:
+        return []
+    if n <= 3:
+        return [(pts[i], pts[(i + 1) % n]) for i in range(n)]
+
+    curv = contour_curvature_scores(pts, window=max(2, min(4, n // 8)))
+    spans = []
+    i = 0
+    # Keep the closing segment separate; this avoids complex wrap bookkeeping and
+    # costs at most one extra edge object.
+    while i < n - 1:
