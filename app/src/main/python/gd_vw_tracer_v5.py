@@ -12,6 +12,15 @@ try:
 except Exception:
     pass
 
+# v0.8: add exact checkpoints around the Shapely calls immediately after the
+# Android inscribed-center helper. This mirrors the original candidate-center
+# logic and changes only diagnostics, not candidate order or scoring.
+try:
+    from mobile_post_center_diag import install_post_center_diagnostics
+    install_post_center_diagnostics(globals())
+except Exception:
+    pass
+
 # Keep connected-region masks bit-packed on Android and reconstruct one at a
 # time. Desktop/multiworker calls still use the original vectorizer.
 try:
