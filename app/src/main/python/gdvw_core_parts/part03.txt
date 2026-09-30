@@ -1,0 +1,300 @@
+        start = i
+        end = i + 1
+        while end < n - 1:
+            nxt = end + 1
+            a, b, c = pts[start], pts[end], pts[nxt]
+            v1 = b - a
+            v2 = c - b
+            if np.linalg.norm(v1) < 1e-8 or np.linalg.norm(v2) < 1e-8:
+                break
+            a1 = math.degrees(math.atan2(v1[1], v1[0]))
+            a2 = math.degrees(math.atan2(v2[1], v2[0]))
+            turn = angle_delta(a1, a2)
+            local_curve = float(np.clip(max(curv[end], turn / 50.0), 0.0, 1.0))
+            # User-requested behavior: high threshold on straight edges, low on curves.
+            rotate_threshold = 24.0 * (1.0 - local_curve) + 6.0 * local_curve
+
+            chord = c - a
+            chord_len = float(np.linalg.norm(chord))
+            if chord_len < 1e-8:
+                break
+            mid_pts = pts[start + 1:nxt]
+            if len(mid_pts):
+                deviation = float(np.max(_point_segment_distances(mid_pts, a, c)))
+            else:
+                deviation = 0.0
+            max_deviation = 0.72 * (1.0 - local_curve) + 0.24 * local_curve
+
+            if turn <= rotate_threshold and deviation <= max_deviation:
+                end = nxt
+            else:
+                break
+        spans.append((pts[start], pts[end]))
+        i = end
+    spans.append((pts[-1], pts[0]))
+    return spans
+
+
+def ring_edge_rectangles(poly: Polygon, ring_coords, edge_width: float,
+                         overlap: float = 0.12):
+    """Turn the VW ring into inward edge strips with adaptive rotation density."""
+    spans = adaptive_edge_spans(ring_coords)
+    if not spans:
+        return []
+    out = []
+    prepared_poly = prep(poly.buffer(1e-6))
+    for a, b in spans:
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        length = math.hypot(dx, dy)
+        if length < 0.35:
+            continue
+        ux, uy = dx / length, dy / length
+        nx, ny = -uy, ux
+        mx, my = (a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0
+
+        probe = max(0.45, edge_width * 0.7)
+        p1 = Point(mx + nx * probe, my + ny * probe)
+        p2 = Point(mx - nx * probe, my - ny * probe)
+        if poly.covers(p1):
+            sign = 1.0
+        elif poly.covers(p2):
+            sign = -1.0
+        else:
+            p1s = Point(mx + nx * 0.2, my + ny * 0.2)
+            sign = 1.0 if poly.covers(p1s) else -1.0
+
+        angle = math.degrees(math.atan2(dy, dx))
+        width = edge_width
+        cx = mx + sign * nx * (width / 2.0 + 0.015)
+        cy = my + sign * ny * (width / 2.0 + 0.015)
+        desired_len = length + min(width * overlap, 0.45)
+
+        candidates = [
+            (desired_len, width),
+            (length, width),
+            (length, width * 0.82),
+            (length * 0.96, width * 0.72),
+        ]
+        chosen = None
+        for rw, rh in candidates:
+            r = rect_polygon(cx, cy, max(0.25, rw), max(0.25, rh), angle)
+            if prepared_poly.covers(r):
+                chosen = (cx, cy, max(0.25, rw), max(0.25, rh), normalize_angle(angle))
+                break
+        if chosen is not None:
+            out.append(chosen)
+    return out
+
+def cage_edge_rectangles(poly: Polygon, area_hint: int):
+    # Slightly thicker on large masses, but still thin enough to preserve detail.
+    edge_width = 0.90 if area_hint < 120 else 1.05 if area_hint < 700 else 1.20
+    out = ring_edge_rectangles(poly, poly.exterior.coords, edge_width)
+    for interior in poly.interiors:
+        out.extend(ring_edge_rectangles(poly, interior.coords, edge_width))
+    return out
+
+
+def cleanup_residual_vector(cage: Polygon, existing_rects, edge_rects,
+                            area_hint: int, safety_margin: float = 0.04):
+    """Vector-only cleanup for thin residual slivers.
+
+    No raster mask is consulted. Residual = VW polygon minus the union of the
+    already-placed vector rectangles. Long, thin rectangles are then fitted to
+    the residual pieces until the remaining polygon area is tiny.
+    """
+    geoms = [rect_polygon(cx, cy, w, h, a)
+             for cx, cy, w, h, a in existing_rects]
+    geoms += [rect_polygon(cx, cy, w, h, a)
+              for cx, cy, w, h, a in edge_rects]
+    coverage = unary_union(geoms).buffer(0) if geoms else None
+    residual = cage.difference(coverage).buffer(0) if coverage is not None else cage.buffer(0)
+
+    safe = cage.buffer(-safety_margin, join_style=2)
+    if safe.is_empty:
+        safe = cage
+    safe = largest_polygon_piece(safe)
+    if safe is None:
+        return [], residual.area / max(1.0, cage.area)
+    safe_prepared = prep(safe)
+
+    if area_hint >= 4000:
+        budget = 16
+    elif area_hint >= 1500:
+        budget = 12
+    elif area_hint >= 500:
+        budget = 5
+    elif area_hint >= 150:
+        budget = 5
+    else:
+        budget = 4
+
+    additions = []
+    stop_area = max(0.8, cage.area * (0.008 if area_hint >= 500 else 0.018))
+
+    for _ in range(budget):
+        piece = largest_polygon_piece(residual)
+        if piece is None or piece.area <= stop_area:
+            break
+        try:
+            mic = maximum_inscribed_circle(piece, tolerance=max(0.08, math.sqrt(piece.area) * 0.006))
+            c0 = list(mic.coords)[0]
+            center = (float(c0[0]), float(c0[1]))
+        except Exception:
+            rp = piece.representative_point()
+            center = (rp.x, rp.y)
+
+        long_len, short_len, base = rectangle_dimensions_and_angle(piece)
+        ratio = float(np.clip(long_len / max(short_len, 1e-6), 1.0, 30.0))
+        local_rot = dynamic_rotation_threshold(piece, 32.0)
+        correction = 7.0 if local_rot < 20.0 else 12.0
+        angles = [normalize_angle(base), normalize_angle(base + correction), normalize_angle(base - correction)]
+        aspects = [ratio, max(1.0, ratio * 0.58), min(30.0, max(4.0, ratio * 1.45)), 8.0, 3.0, 1.4]
+        uniq_aspects = []
+        for a in aspects:
+            a = float(np.clip(a, 1.0, 30.0))
+            if all(abs(a-q) > 0.28 for q in uniq_aspects):
+                uniq_aspects.append(a)
+        best = None
+        for angle in angles:
+            for aspect in uniq_aspects[:5]:
+                fit = grow_inscribed_rectangle(safe, safe_prepared, piece,
+                                               center, angle, aspect,
+                                               binary_steps=8)
+                if fit is None:
+                    continue
+                rect, gain = fit
+                score = gain + 0.012 * rect.area
+                if best is None or score > best[0]:
+                    best = (score, rect, gain)
+        if best is None or best[2] < 0.55:
+            break
+        rect = best[1]
+        additions.append(decode_rect(rect))
+        residual = residual.difference(rect).buffer(0)
+        if residual.is_empty:
+            break
+
+    return additions, residual.area / max(1.0, cage.area)
+
+
+
+def quick_detail_fill(poly: Polygon, area_hint: int, safety_margin: float = 0.02):
+    """Cheap vector-only fill for tiny source details.
+
+    Tiny facial/highlight/text-like regions should survive segmentation without
+    paying the full residual-search cost. Keep their adaptive VW cage and add
+    at most 1-3 broad inscribed rectangles.
+    """
+    if poly is None or poly.is_empty or poly.area <= 0:
+        return [], []
+    safe = poly.buffer(-max(0.005, safety_margin), join_style=2)
+    if safe.is_empty:
+        safe = poly
+    safe = largest_polygon_piece(safe)
+    if safe is None:
+        return [], []
+    prepared = prep(safe)
+    piece = safe
+    rects, gains = [], []
+    budget = 1 if area_hint < 35 else 2 if area_hint < 120 else 3
+    previous = None
+    for _ in range(budget):
+        piece = largest_polygon_piece(piece)
+        if piece is None or piece.area < 0.35:
+            break
+        rp = piece.representative_point()
+        centers = [(rp.x, rp.y)]
+        if piece.covers(piece.centroid):
+            centers.append((piece.centroid.x, piece.centroid.y))
+        base = normalize_angle(rectangle_dimensions_and_angle(piece)[2])
+        angles = [base]
+        if previous is not None and angle_delta(previous, base) < 24:
+            angles.insert(0, previous)
+        best = None
+        for center in centers[:2]:
+            for angle in angles[:2]:
+                fit = grow_inscribed_rectangle_free(
+                    safe, prepared, piece, center, angle,
+                    binary_steps=7, height_samples=5)
+                if fit is None:
+                    continue
+                rect, gain = fit
+                score = gain + 0.02 * rect.area
+                if best is None or score > best[0]:
+                    best = (score, rect, gain, angle)
+        if best is None or best[2] < 0.25:
+            break
+        rects.append(decode_rect(best[1]))
+        gains.append(float(best[2]))
+        previous = best[3]
+        piece = piece.difference(best[1]).buffer(0)
+    return rects, gains
+
+def process_region_job(job):
+    """Worker for one source region with fidelity-aware treatment."""
+    (area, ci, ox, oy, component, base_vw_area,
+     rotation_threshold, safety_margin, region_id, z_rank) = job
+
+    # Preserve tiny source details with a substantially lower effective VW area.
+    local_vw = base_vw_area
+    if area < 70:
+        local_vw *= 0.30
+    elif area < 220:
+        local_vw *= 0.46
+    elif area < 700:
+        local_vw *= 0.68
+
+    poly = build_region_polygon(component, local_vw)
+    if poly is None:
+        return None
+
+    edge_rects = cage_edge_rectangles(poly, area)
+    edge_geoms = [rect_polygon(cx, cy, width, height, angle)
+                  for cx, cy, width, height, angle in edge_rects]
+    edge_coverage = unary_union(edge_geoms).buffer(0) if edge_geoms else None
+
+    if area < 300:
+        # Fast detail path: the edge cage carries the exact silhouette and only
+        # a few broad vector blocks are needed to make it solid.
+        rects, fill_gains = quick_detail_fill(
+            poly, area, safety_margin=max(0.008, safety_margin * 0.45))
+        geoms = edge_geoms + [rect_polygon(*r) for r in rects]
+        cov = unary_union(geoms).intersection(poly).area if geoms else 0.0
+        coverage_ratio = cov / max(1.0, poly.area)
+        edge_ratio = (edge_coverage.intersection(poly).area / max(1.0, poly.area)
+                      if edge_coverage is not None else 0.0)
+    else:
+        rects, coverage_ratio, edge_ratio, fill_gains = fit_region(
+            poly, area,
+            rotation_threshold=rotation_threshold,
+            safety_margin=safety_margin,
+            initial_coverage=edge_coverage)
+
+    local_objects = []
+    for fill_idx, (cx, cy, width, height, angle) in enumerate(rects):
+        estimated_gain = (fill_gains[fill_idx]
+                          if fill_idx < len(fill_gains)
+                          else max(0.25, width * height * 0.35))
+        local_objects.append({
+            "kind": "rotated_rect",
+            "color": ci,
+            "rr": (cx + ox, cy + oy, width, height, angle),
+            "region_area": area,
+            "region_id": region_id,
+            "z_rank": z_rank,
+            "role": "detail_fill" if area < 300 else "fill",
+            "gain": float(estimated_gain),
+        })
+    for cx, cy, width, height, angle in edge_rects:
+        local_objects.append({
+            "kind": "rotated_rect",
+            "color": ci,
+            "rr": (cx + ox, cy + oy, width, height, angle),
+            "region_area": area,
+            "region_id": region_id,
+            "z_rank": z_rank,
+            "role": "vw_edge",
+            "gain": float(max(0.25, width * height)),
+        })
+
+    stat = {
