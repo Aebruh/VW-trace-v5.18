@@ -11,8 +11,8 @@ android {
         applicationId = "com.gdvw.tracer"
         minSdk = 24
         targetSdk = 36
-        versionCode = 8
-        versionName = "0.8.0"
+        versionCode = 9
+        versionName = "0.9.0"
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
