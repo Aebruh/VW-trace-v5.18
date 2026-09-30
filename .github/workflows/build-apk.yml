@@ -9,6 +9,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
 
     steps:
       - name: Checkout
@@ -30,8 +33,8 @@ jobs:
         with:
           gradle-version: '9.4.1'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Accept Android SDK licenses
+        run: yes | sdkmanager --licenses >/dev/null || true
 
       - name: Install Android SDK 36
         run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
