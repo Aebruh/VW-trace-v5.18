@@ -4,6 +4,8 @@ on:
   workflow_dispatch:
   push:
     branches: [ main ]
+    paths:
+      - BUILD_MARKER.txt
 
 jobs:
   build:
@@ -45,6 +47,6 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: GDVWTracer-v0.1-debug-apk
+          name: GDVWTracer-v0.2-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
