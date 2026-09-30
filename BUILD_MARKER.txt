@@ -1,1 +1,1 @@
-Triggers Android APK build for v0.5 low-allocation GEOS rectangle path and deep region diagnostics.
+Triggers Android APK build for v0.6 Android-safe inscribed-center fallback.
