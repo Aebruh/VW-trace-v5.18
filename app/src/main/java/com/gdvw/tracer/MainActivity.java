@@ -65,7 +65,7 @@ public class MainActivity extends Activity {
         root.addView(title);
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("Local PNG → Geometry Dash .gmd tracer • Android v0.6");
+        subtitle.setText("Local PNG → Geometry Dash .gmd tracer • Android v0.7");
         subtitle.setTextSize(14);
         subtitle.setTextColor(Color.DKGRAY);
         subtitle.setPadding(0, 0, 0, dp(18));
