@@ -15,8 +15,32 @@ original process_region_job function.
 """
 
 import gc
+import os
+from pathlib import Path
 import numpy as np
 import cv2
+
+
+def _rss_mb():
+    try:
+        for line in Path('/proc/self/status').read_text(errors='ignore').splitlines():
+            if line.startswith('VmRSS:'):
+                return round(int(line.split()[1]) / 1024.0, 1)
+    except Exception:
+        pass
+    return None
+
+
+def _progress(label: str):
+    path = os.environ.get('GDVW_STAGE_FILE')
+    if not path:
+        return
+    try:
+        rss = _rss_mb()
+        text = label if rss is None else f'{label} [RAM {rss} MB]'
+        Path(path).write_text(text, encoding='utf8')
+    except Exception:
+        pass
 
 
 def install_android_vectorize(namespace: dict) -> None:
@@ -29,8 +53,6 @@ def install_android_vectorize(namespace: dict) -> None:
                              rotation_threshold=30.0,
                              safety_margin=0.03,
                              workers=4):
-        # Preserve the original desktop/multiprocessing path exactly. The Android
-        # bridge explicitly requests workers=1, which selects the streamed path.
         workers_i = max(1, int(workers))
         if workers_i != 1:
             return original_vectorize(
@@ -42,13 +64,12 @@ def install_android_vectorize(namespace: dict) -> None:
                 workers=workers_i,
             )
 
-        # Same connected-component pass and same ordering as the original, but
-        # retain each crop as packed bytes rather than a full bool ndarray.
         regions = []
         for ci in range(len(colors)):
             if ci == background:
                 continue
 
+            _progress(f'vectorizer scanning color {ci + 1}/{len(colors)}')
             mask = (labels == ci).astype(np.uint8)
             n, cc, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
 
@@ -61,11 +82,9 @@ def install_android_vectorize(namespace: dict) -> None:
                 packed = np.packbits(component, axis=None).tobytes()
                 regions.append((area, ci, x, y, w, h, packed))
 
-            # These are large per-colour temporaries and are no longer needed.
             del mask, cc, stats
             gc.collect()
 
-        # Identical stable order: large base masses first, details later.
         regions.sort(key=lambda r: r[0], reverse=True)
         total_regions = len(regions)
         detail_regions = sum(r[0] < 300 for r in regions)
@@ -78,7 +97,14 @@ def install_android_vectorize(namespace: dict) -> None:
         for region_id in range(total_regions):
             area, ci, ox, oy, w, h, packed = regions[region_id]
 
-            # Reconstruct exactly the same boolean crop the original code used.
+            # Force collection before the next GEOS-heavy region. This is slower
+            # than desktop mode but keeps Android peak memory predictable.
+            gc.collect()
+            _progress(
+                f'vectorizing region {region_id + 1}/{total_regions} '
+                f'(area {area}, size {w}x{h}, color {ci})'
+            )
+
             bits = np.frombuffer(packed, dtype=np.uint8)
             component = np.unpackbits(bits, count=w * h).reshape((h, w)).astype(np.bool_, copy=False)
 
@@ -96,17 +122,11 @@ def install_android_vectorize(namespace: dict) -> None:
                 cage_area_sum += poly_area
                 covered_area_sum += covered_area
 
-            # Drop the packed mask and reconstructed ndarray as soon as this region
-            # is complete. Replacing the list entry also releases its bytes early.
             regions[region_id] = None
             del component, bits, packed, job, result
+            gc.collect()
 
-            # GEOS/Shapely creates many short-lived Python wrappers during fitting.
-            # Periodic collection prevents those wrappers piling up between regions.
-            if region_id % 4 == 3:
-                gc.collect()
-
-        gc.collect()
+        _progress(f'vectorization complete ({total_regions} regions)')
         return objects, {
             "regions": total_regions,
             "detail_regions": detail_regions,
@@ -116,6 +136,5 @@ def install_android_vectorize(namespace: dict) -> None:
             "largest_region_stats": region_report[:25],
         }
 
-    # Keep a reference for debugging/comparison and replace only the public entry.
     namespace["vectorize_desktop_original"] = original_vectorize
     namespace["vectorize"] = vectorize_low_memory
