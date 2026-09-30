@@ -1,0 +1,28 @@
+{
+  "reference_width": 512,
+  "evaluation_scale": 4,
+  "protect_component_area": 20,
+  "protect_thin_radius": 0.3,
+  "seam_max_area": 0.1,
+  "max_boundary_shift": 0.8,
+  "max_extra_error": 8,
+  "max_candidate_error": 12,
+  "region_radius": 15,
+  "max_neighbors": 16,
+  "max_passes": 2,
+  "chain_angle_degrees": 15,
+  "chain_thickness_ratio": 4,
+  "max_seam_patches": 2,
+  "candidate_insets": [
+    0,
+    0.2,
+    0.4
+  ],
+  "centerline_fit": true,
+  "protect_context_area": 80,
+  "protect_context_radius": 10,
+  "protect_context_contrast": 64,
+  "seam_min_area": 0.01,
+  "profile_name": "Quality",
+  "optimizer": "v5.17"
+}
