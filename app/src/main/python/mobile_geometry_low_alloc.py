@@ -49,8 +49,6 @@ def _direct_rect(cx, cy, width, height, angle_deg):
     c = math.cos(th)
     s = math.sin(th)
 
-    # Keep a stable counter-clockwise ring. GEOS sees the same rectangle shape as
-    # the desktop affinity path, but without allocating intermediate geometries.
     coords = []
     for x, y in ((-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)):
         coords.append((float(cx) + c * x - s * y,
@@ -61,6 +59,7 @@ def _direct_rect(cx, cy, width, height, angle_deg):
 def install_android_geometry(namespace: dict) -> None:
     original_rect_polygon = namespace['rect_polygon']
     original_grow_free = namespace['grow_inscribed_rectangle_free']
+    grow_call_counter = {'value': 0}
 
     def rect_polygon_low_alloc(cx, cy, width, height, angle_deg):
         return _direct_rect(cx, cy, width, height, angle_deg)
@@ -70,11 +69,13 @@ def install_android_geometry(namespace: dict) -> None:
                                                 center, angle,
                                                 binary_steps=8,
                                                 height_samples=7):
-        # Same rotated target bounds as affinity.rotate(target_piece, -angle,
-        # origin=center), calculated numerically from the exterior ring. Holes
-        # cannot extend beyond the exterior, so they do not affect bounds.
+        grow_call_counter['value'] += 1
+        call_id = grow_call_counter['value']
+        _progress(f'rect fit {call_id}: reading target exterior')
+
         cx, cy = center
         pts = np.asarray(target_piece.exterior.coords, dtype=np.float64)
+        _progress(f'rect fit {call_id}: target exterior ready ({len(pts)} pts)')
         if len(pts) == 0:
             return None
 
@@ -83,62 +84,83 @@ def install_android_geometry(namespace: dict) -> None:
         s = math.sin(th)
         dx = pts[:, 0] - float(cx)
         dy = pts[:, 1] - float(cy)
-
-        # Rotation by -angle around (cx, cy).
         lx = float(cx) + c * dx + s * dy
         ly = float(cy) - s * dx + c * dy
         minx = float(np.min(lx)); maxx = float(np.max(lx))
         miny = float(np.min(ly)); maxy = float(np.max(ly))
-
         max_half_w = max(0.15, max(abs(maxx - cx), abs(cx - minx)))
         max_half_h = max(0.15, max(abs(maxy - cy), abs(cy - miny)))
+        _progress(f'rect fit {call_id}: numeric bounds ready')
 
         fracs = np.linspace(0.16, 1.0, height_samples)
         best = None
-        for frac in fracs:
+        for frac_index, frac in enumerate(fracs, start=1):
             half_h = max(0.12, max_half_h * float(frac))
             low, high = 0.12, max_half_w
             best_rect = None
-            for _ in range(binary_steps):
+            for step in range(1, binary_steps + 1):
                 half_w = (low + high) / 2.0
+                tag = f'rect fit {call_id} A{frac_index}/{len(fracs)} step {step}/{binary_steps}'
+                _progress(tag + ': creating rectangle')
                 rect = _direct_rect(cx, cy, 2.0 * half_w, 2.0 * half_h, angle)
-                if safe_prepared.covers(rect):
+                _progress(tag + ': rectangle ready')
+                _progress(tag + ': prepared covers')
+                inside = safe_prepared.covers(rect)
+                _progress(tag + f': prepared covers ready ({inside})')
+                if inside:
                     best_rect = rect
                     low = half_w
                 else:
                     high = half_w
             if best_rect is None:
                 continue
-            gain = best_rect.intersection(target_piece).area
+            tag = f'rect fit {call_id} A{frac_index}/{len(fracs)}'
+            _progress(tag + ': intersecting target')
+            overlap = best_rect.intersection(target_piece)
+            _progress(tag + ': intersection ready')
+            gain = overlap.area
+            _progress(tag + f': intersection area ready ({gain:.2f})')
             score = gain + 0.035 * best_rect.area
             if best is None or score > best[0]:
                 best = (score, best_rect, gain)
 
-        for frac in np.linspace(0.16, 1.0, max(4, height_samples - 2)):
+        fracs_b = np.linspace(0.16, 1.0, max(4, height_samples - 2))
+        for frac_index, frac in enumerate(fracs_b, start=1):
             half_w = max(0.12, max_half_w * float(frac))
             low, high = 0.12, max_half_h
             best_rect = None
-            for _ in range(binary_steps):
+            for step in range(1, binary_steps + 1):
                 half_h = (low + high) / 2.0
+                tag = f'rect fit {call_id} B{frac_index}/{len(fracs_b)} step {step}/{binary_steps}'
+                _progress(tag + ': creating rectangle')
                 rect = _direct_rect(cx, cy, 2.0 * half_w, 2.0 * half_h, angle)
-                if safe_prepared.covers(rect):
+                _progress(tag + ': rectangle ready')
+                _progress(tag + ': prepared covers')
+                inside = safe_prepared.covers(rect)
+                _progress(tag + f': prepared covers ready ({inside})')
+                if inside:
                     best_rect = rect
                     low = half_h
                 else:
                     high = half_h
             if best_rect is None:
                 continue
-            gain = best_rect.intersection(target_piece).area
+            tag = f'rect fit {call_id} B{frac_index}/{len(fracs_b)}'
+            _progress(tag + ': intersecting target')
+            overlap = best_rect.intersection(target_piece)
+            _progress(tag + ': intersection ready')
+            gain = overlap.area
+            _progress(tag + f': intersection area ready ({gain:.2f})')
             score = gain + 0.035 * best_rect.area
             if best is None or score > best[0]:
                 best = (score, best_rect, gain)
 
         if best is None or best[2] <= 0:
+            _progress(f'rect fit {call_id}: no usable rectangle')
             return None
+        _progress(f'rect fit {call_id}: complete')
         return best[1], best[2]
 
-    # Diagnostic wrappers around the exact existing region stages. These don't
-    # alter returned values; they only update crash_stage.txt before/after calls.
     original_build_region_polygon = namespace['build_region_polygon']
     original_cage_edges = namespace['cage_edge_rectangles']
     original_fit_region = namespace['fit_region']
