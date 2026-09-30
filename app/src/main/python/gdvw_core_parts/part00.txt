@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+"""GD VW Tracer v4.9 - adaptive VW cage + large-overlap vector filler.
+
+After segmentation:
+  region -> VW polygon cage -> large inscribed rotated rectangles.
+No raster/grid packing is used for geometry placement.
+
+v4.7 changes:
+- local curvature controls the VW removal threshold: curved sections keep more points, straight sections simplify harder,
+- a chord-deviation guard prevents long VW chords from cutting across curves into triangle-like cages,
+- the fill rotation threshold is dynamic: low on curved residuals and high on straight residuals,
+- safety-inset polygon containment remains a hard rule; no fill rectangle may cross the VW cage,
+- overlapping rectangles are allowed and encouraged.
+"""
+from __future__ import annotations
+
+import argparse
+import heapq
+import os
+from concurrent.futures import ProcessPoolExecutor
+import json
+import math
+from collections import Counter
+from pathlib import Path
+from xml.sax.saxutils import escape
+
+import cv2
+import numpy as np
+from PIL import Image
+from shapely import affinity
+from shapely.geometry import Polygon, box, Point
+from shapely.ops import unary_union
+from shapely.prepared import prep
+from shapely_compat import maximum_inscribed_circle
+
+SQUARE_ID = 211
+SQUARE_SIZE = 30.0
+
+# ---------------------------------------------------------------------------
+# Palette / segmentation
+# ---------------------------------------------------------------------------
+
+def rgb_key(rgb):
+    a = rgb.astype(np.uint32)
+    return (a[..., 0] << 16) | (a[..., 1] << 8) | a[..., 2]
+
+
+def stable_palette(source: Image.Image, max_colors=24,
+                   min_core_pixels=20, min_total_pixels=30,
+                   merge_lab=3.0):
+    rgba = np.asarray(source.convert("RGBA"))
+    rgb = rgba[..., :3]
+    alpha = rgba[..., 3]
+
+    stable = alpha > 24
+    stable[1:, :] &= np.all(rgb[1:, :] == rgb[:-1, :], axis=2)
+    stable[:-1, :] &= np.all(rgb[:-1, :] == rgb[1:, :], axis=2)
+    stable[:, 1:] &= np.all(rgb[:, 1:] == rgb[:, :-1], axis=2)
+    stable[:, :-1] &= np.all(rgb[:, :-1] == rgb[:, 1:], axis=2)
+
+    core_counts = Counter(map(tuple, rgb[stable]))
+    total_counts = Counter(map(tuple, rgb[alpha > 24]))
+    selected = []
+    selected_lab = []
+
+    for color, core_n in core_counts.most_common():
+        if core_n < min_core_pixels or total_counts[color] < min_total_pixels:
+            continue
+        c = np.asarray(color, dtype=np.uint8).reshape(1, 1, 3)
+        lab = cv2.cvtColor(c, cv2.COLOR_RGB2LAB).reshape(3).astype(np.float32)
+        if all(float(np.linalg.norm(lab - old)) > merge_lab for old in selected_lab):
+            selected.append(tuple(int(v) for v in color))
+            selected_lab.append(lab)
+            if len(selected) >= max_colors:
+                break
+
+    if not selected:
+        opaque = rgb[alpha > 24]
+        selected = [tuple(int(v) for v in Counter(map(tuple, opaque)).most_common(1)[0][0])]
+    return np.asarray(selected, dtype=np.uint8)
+
+
+def edge_aware_labels(work: Image.Image, colors: np.ndarray,
+                      propagation_steps=4):
+    rgba = np.asarray(work.convert("RGBA"))
+    rgb = rgba[..., :3]
+    opaque = rgba[..., 3] > 24
+    h, w = opaque.shape
+
+    keys = rgb_key(rgb)
+    labels = np.full((h, w), -1, dtype=np.int16)
+    seeded = np.zeros((h, w), dtype=bool)
+    for i, color in enumerate(colors):
+        key = (int(color[0]) << 16) | (int(color[1]) << 8) | int(color[2])
+        m = (keys == key) & opaque
+        labels[m] = i
+        seeded[m] = True
+
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    plab = cv2.cvtColor(colors.reshape(1, -1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
+    shifts = [(-1, 0), (1, 0), (0, -1), (0, 1),
+              (-1, -1), (-1, 1), (1, -1), (1, 1)]
+
+    for _ in range(max(0, propagation_steps)):
+        unresolved = (labels < 0) & opaque
+        if not np.any(unresolved):
+            break
+        best_cost = np.full((h, w), np.float32(1e30))
+        best_label = np.full((h, w), -1, dtype=np.int16)
+        for dy, dx in shifts:
+            shifted = np.roll(labels, shift=(dy, dx), axis=(0, 1))
+            if dy < 0:
+                shifted[dy:, :] = -1
+            elif dy > 0:
+                shifted[:dy, :] = -1
+            if dx < 0:
+                shifted[:, dx:] = -1
+            elif dx > 0:
+                shifted[:, :dx] = -1
+            valid = unresolved & (shifted >= 0)
+            if not np.any(valid):
+                continue
+            yy, xx = np.nonzero(valid)
+            idx = shifted[yy, xx]
+            d = lab[yy, xx] - plab[idx]
+            cost = np.sum(d * d, axis=1)
+            better = cost < best_cost[yy, xx]
+            yy2, xx2 = yy[better], xx[better]
+            best_cost[yy2, xx2] = cost[better]
+            best_label[yy2, xx2] = idx[better]
+        take = unresolved & (best_label >= 0)
+        labels[take] = best_label[take]
+
+    flat_labels = labels.reshape(-1)
+    flat_lab = lab.reshape(-1, 3)
+    unresolved_idx = np.flatnonzero((flat_labels < 0) & opaque.reshape(-1))
+    for start in range(0, len(unresolved_idx), 100000):
+        ii = unresolved_idx[start:start + 100000]
+        d = flat_lab[ii, None, :] - plab[None, :, :]
+        flat_labels[ii] = np.argmin(np.sum(d * d, axis=2), axis=1)
+
+    labels = flat_labels.reshape(h, w)
+    labels[~opaque] = -1
+    return labels, seeded
+
+# ---------------------------------------------------------------------------
+# VW contour / polygon cage
+# ---------------------------------------------------------------------------
+
+def vw_simplify(points: np.ndarray, area_limit: float) -> np.ndarray:
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    n = len(pts)
+    if n <= 4 or area_limit <= 0:
+        return pts
+
+    left = list(range(-1, n - 1))
+    left[0] = n - 1
+    right = list(range(1, n + 1))
+    right[-1] = 0
+    alive = [True] * n
+    version = [0] * n
+
+    def tri_area(i):
+        a, b, c = pts[left[i]], pts[i], pts[right[i]]
+        u, v = b - a, c - a
+        return abs(float(u[0] * v[1] - u[1] * v[0])) / 2.0
+
+    heap = [(tri_area(i), i, 0) for i in range(n)]
+    heapq.heapify(heap)
+    remaining = n
+    floor = 0.0
+
+    while heap and remaining > 4:
+        value, i, ver = heapq.heappop(heap)
+        if not alive[i] or ver != version[i]:
+            continue
+        floor = max(floor, value)
+        if floor > area_limit:
+            break
+        a, b = left[i], right[i]
+        alive[i] = False
+        remaining -= 1
+        right[a] = b
+        left[b] = a
+        for j in (a, b):
+            version[j] += 1
+            heapq.heappush(heap, (max(floor, tri_area(j)), j, version[j]))
+
+    return pts[np.asarray(alive, dtype=bool)]
+
+
+
+def contour_curvature_scores(points: np.ndarray, window: int = 4) -> np.ndarray:
+    """Return 0..1 local curvature scores for a closed contour.
+
+    The score uses a wider-window turning angle plus chord deviation, so a smooth
+    arc is recognized as curved even when individual adjacent pixels turn only a
+    little. Straight runs stay near zero.
+    """
+    p = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    n = len(p)
+    if n < 5:
+        return np.zeros(n, dtype=np.float64)
+    w = max(2, min(int(window), max(2, n // 8)))
+    prev = np.roll(p, w, axis=0)
+    nxt = np.roll(p, -w, axis=0)
+    vin = p - prev
+    vout = nxt - p
+    nin = np.linalg.norm(vin, axis=1)
+    nout = np.linalg.norm(vout, axis=1)
+    denom = np.maximum(nin * nout, 1e-9)
+    cosang = np.clip(np.sum(vin * vout, axis=1) / denom, -1.0, 1.0)
+    turn_deg = np.degrees(np.arccos(cosang))  # straight ~= 0
+
+    chord = nxt - prev
+    chord_len = np.linalg.norm(chord, axis=1)
+    rel = p - prev
+    cross = np.abs(chord[:, 0] * rel[:, 1] - chord[:, 1] * rel[:, 0])
+    dev = cross / np.maximum(chord_len, 1e-9)
+
+    turn_score = np.clip(turn_deg / 48.0, 0.0, 1.0)
+    dev_score = np.clip(dev / 2.4, 0.0, 1.0)
+    score = np.maximum(turn_score, 0.72 * dev_score)
+    # Smooth the score itself so an arc gets a continuous protected zone.
+    score = (np.roll(score, 1) + 2.0 * score + np.roll(score, -1)) / 4.0
+    return np.clip(score, 0.0, 1.0)
+
+
+def vw_simplify_dynamic(points: np.ndarray, base_area_limit: float,
+                        curvature_scores: np.ndarray | None = None,
+                        curved_limit_factor: float = 0.10):
+    """Curvature-weighted VW simplification returning points and source indices.
+
+    A straight vertex may be removed at roughly ``base_area_limit`` while a
+    strongly curved vertex gets only ``curved_limit_factor`` of that threshold.
+    """
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    n = len(pts)
+    if n <= 4 or base_area_limit <= 0:
+        return pts, np.arange(n, dtype=np.int32)
+    if curvature_scores is None or len(curvature_scores) != n:
+        curvature_scores = contour_curvature_scores(pts)
+    curv = np.asarray(curvature_scores, dtype=np.float64)
+    factors = 1.0 - (1.0 - curved_limit_factor) * np.clip(curv, 0.0, 1.0)
+    limits = np.maximum(base_area_limit * factors, base_area_limit * curved_limit_factor)
+
+    left = list(range(-1, n - 1)); left[0] = n - 1
+    right = list(range(1, n + 1)); right[-1] = 0
+    alive = [True] * n
+    version = [0] * n
+
+    def tri_area(i):
+        a, b, c = pts[left[i]], pts[i], pts[right[i]]
+        u, v = b - a, c - a
+        return abs(float(u[0] * v[1] - u[1] * v[0])) / 2.0
+
+    def key(i):
+        return tri_area(i) / max(limits[i], 1e-9)
+
+    heap = [(key(i), i, 0) for i in range(n)]
+    heapq.heapify(heap)
+    remaining = n
+    while heap and remaining > 4:
+        ratio, i, ver = heapq.heappop(heap)
+        if not alive[i] or ver != version[i]:
+            continue
+        # ratio > 1 means the local, curvature-dependent VW threshold says keep it.
+        if ratio > 1.0:
+            break
+        a, b = left[i], right[i]
+        alive[i] = False
+        remaining -= 1
+        right[a] = b
+        left[b] = a
+        for j in (a, b):
+            version[j] += 1
+            heapq.heappush(heap, (key(j), j, version[j]))
+
+    idx = np.flatnonzero(np.asarray(alive, dtype=bool)).astype(np.int32)
+    return pts[idx], idx
+
+
+def _point_segment_distances(points: np.ndarray, a: np.ndarray, b: np.ndarray):
+    ab = b - a
+    lab2 = float(np.dot(ab, ab))
+    if lab2 < 1e-12:
+        return np.linalg.norm(points - a, axis=1)
+    t = np.clip(((points - a) @ ab) / lab2, 0.0, 1.0)
+    proj = a + t[:, None] * ab
+    return np.linalg.norm(points - proj, axis=1)
+
+
+def enforce_dynamic_chord_guard(points: np.ndarray, kept_indices: np.ndarray,
+                                curvature_scores: np.ndarray,
+                                straight_max_deviation: float = 2.6,
+                                curved_max_deviation: float = 0.72,
+                                straight_max_chord: float = 72.0,
+                                curved_max_chord: float = 11.0):
+    """Reinsert contour points when a VW chord cuts across a curved arc.
+
