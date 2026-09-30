@@ -65,7 +65,7 @@ public class MainActivity extends Activity {
         root.addView(title);
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("Local PNG → Geometry Dash .gmd tracer • Android v0.2");
+        subtitle.setText("Local PNG → Geometry Dash .gmd tracer • Android v0.4");
         subtitle.setTextSize(14);
         subtitle.setTextColor(Color.DKGRAY);
         subtitle.setPadding(0, 0, 0, dp(18));
@@ -186,8 +186,9 @@ public class MainActivity extends Activity {
         String selected = profile.getSelectedItem().toString().toLowerCase();
         File work = new File(getFilesDir(), "trace_work");
 
-        // Encourage Android to reclaim temporary UI/file-picker allocations before
-        // NumPy/OpenCV/Shapely start allocating tracing buffers.
+        // The selected PNG preview is not needed while tracing and can occupy
+        // several MB in the same process as Python/NumPy/GEOS.
+        clearPreviewBitmap();
         System.gc();
 
         executor.submit(() -> {
@@ -214,6 +215,17 @@ public class MainActivity extends Activity {
                 });
             }
         });
+    }
+
+    private void clearPreviewBitmap() {
+        Drawable old = preview.getDrawable();
+        preview.setImageDrawable(null);
+        if (old instanceof BitmapDrawable) {
+            Bitmap oldBitmap = ((BitmapDrawable) old).getBitmap();
+            if (oldBitmap != null && !oldBitmap.isRecycled()) {
+                oldBitmap.recycle();
+            }
+        }
     }
 
     private void setPreviewFile(File file, int maxDimension) {
@@ -250,7 +262,7 @@ public class MainActivity extends Activity {
         try (BufferedReader reader = new BufferedReader(new FileReader(stage))) {
             String line = reader.readLine();
             if (line != null && !line.startsWith("COMPLETE")) {
-                status.setText("Previous trace stopped during: " + line + ". You can retry; v0.2 uses lower memory.");
+                status.setText("Previous trace stopped during: " + line);
             }
         } catch (IOException ignored) {
         }
