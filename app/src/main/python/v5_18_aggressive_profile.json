@@ -1,0 +1,42 @@
+{
+  "reference_width": 512,
+  "evaluation_scale": 4,
+  "protect_component_area": 20,
+  "protect_thin_radius": 0.3,
+  "seam_max_area": 0.1,
+  "max_boundary_shift": 4,
+  "max_extra_error": 80,
+  "max_candidate_error": 160,
+  "region_radius": 20,
+  "max_neighbors": 16,
+  "max_passes": 1,
+  "chain_angle_degrees": 15,
+  "chain_thickness_ratio": 4,
+  "max_seam_patches": 0,
+  "candidate_insets": [
+    0,
+    0.6,
+    1.2
+  ],
+  "centerline_fit": true,
+  "protect_context_area": 80,
+  "protect_context_radius": 10,
+  "protect_context_contrast": 64,
+  "seam_min_area": 0.01,
+  "important_boundary_shift": 1.2,
+  "outer_tolerance": 0.8,
+  "normal_error_per_candidate": 8,
+  "angle_bucket_degrees": 8,
+  "automatic_importance": 0.6,
+  "profile_name": "Aggressive",
+  "candidate_scales": [
+    0.8,
+    1,
+    1.2
+  ],
+  "normal_rgb_mae_limit": 3,
+  "normal_changed_fraction_limit": 0.08,
+  "max_prune_error": 40,
+  "max_total_prune_error": 1000,
+  "normal_error_per_deletion": 2.5
+}
