@@ -1,1 +1,1 @@
-Triggers the first Android APK build for v0.1.
+Triggers Android APK build for v0.2 crash-fix release.
