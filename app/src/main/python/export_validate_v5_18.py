@@ -37,25 +37,32 @@ def main():
  deep_missing=original_union.difference(new_union).difference(original_union.boundary.buffer(tolerance+1e-7)).area
  excessive_spill=new_union.difference(shell(original_union).buffer(tolerance+1e-7)).area
  assert deep_missing<1e-5 and excessive_spill<1e-5,(deep_missing,excessive_spill)
- source_scale=2048/size[0]
- def render_full(items):
-  scaled=[dict(o,rr=[float(v)*source_scale if k<4 else float(v) for k,v in enumerate(o['rr'])]) for o in items]
-  return v5.render((2048,round(size[1]*source_scale)),colors,scaled,bg,2)
- image=render_full(decoded);base=render_full(reference);image.save(args.output_dir/(args.name+'_full.png'));image.resize((1024,round(size[1]*1024/size[0])),Image.Resampling.LANCZOS).save(args.output_dir/(args.name+'_preview.png'))
- a=np.asarray(base,dtype=np.int16);b=np.asarray(image,dtype=np.int16);fg=np.linalg.norm(a-colors[bg],axis=2)>20;diff=np.abs(a-b);protected=np.zeros(fg.shape,bool)
+ # Android memory-safe validation. Geometry/export stays unchanged; only the
+ # diagnostic raster validation uses the 512px normal viewing scale, which is
+ # the scale used by v5.18's pass/fail threshold and candidate selection.
+ def render_at(items,width):
+  scale=width/size[0]
+  scaled=[dict(o,rr=[float(v)*scale if k<4 else float(v) for k,v in enumerate(o['rr'])]) for o in items]
+  return v5.render((width,round(size[1]*scale)),colors,scaled,bg,2)
+ image=render_at(decoded,512);base=render_at(reference,512)
+ a=np.asarray(base,dtype=np.int16);b=np.asarray(image,dtype=np.int16);bgc=colors[bg].astype(np.int16)
+ fg=np.max(np.abs(a-bgc),axis=2)>20;diff=np.abs(a-b);protected=np.zeros(fg.shape,bool)
  for x0,y0,x1,y1 in profile.get('protected_boxes_normalized',[]):protected[round(y0*fg.shape[0]):round(y1*fg.shape[0]),round(x0*fg.shape[1]):round(x1*fg.shape[1])]=True
  if args.protection:
   mask=np.load(args.protection).astype(bool);protected|=np.asarray(Image.fromarray(mask).resize((image.width,image.height),Image.Resampling.NEAREST)).astype(bool)
- report={'outer_silhouette_symmetric_difference':outer_difference,'outer_tolerance_reference_pixels':profile.get('outer_tolerance',0),'new_deep_internal_gap_area':deep_missing,'excessive_silhouette_spill_area':excessive_spill,'baseline_roles':dict(Counter(o.get('role','') for o in reference)),'baseline_objects':len(reference),'objects':len(objs),'reduction_percent':round(100*(len(reference)-len(objs))/len(reference),2),'lost_foreground_area_working_pixels':missing,'added_foreground_area_working_pixels':spill,'export_max_corner_error_working_pixels':corner_error,'foreground_rgb_mae_0_to_255':float(diff[fg].mean()),'protected_roi_rgb_mae_0_to_255':float(diff[protected].mean()) if protected.any() else None,'max_gd_z':len(objs)-1,'role_counts':dict(Counter(o.get('role','') for o in objs)),'in_game_verified':False,'limitations':'Intentional bounded silhouette and internal-boundary simplification. Offline preview is decoded from GMD but is not the game renderer.'}
- def metrics(width):
-  dims=(width,round(size[1]*width/size[0]));aa=np.asarray(base.resize(dims,Image.Resampling.LANCZOS),dtype=np.float32);bb=np.asarray(image.resize(dims,Image.Resampling.LANCZOS),dtype=np.float32)
-  mask=(np.max(abs(aa-colors[bg]),2)>20)|(np.max(abs(bb-colors[bg]),2)>20);dd=abs(aa-bb)
-  ga=cv2.cvtColor(aa,cv2.COLOR_RGB2GRAY);gb=cv2.cvtColor(bb,cv2.COLOR_RGB2GRAY);mu_a=cv2.GaussianBlur(ga,(7,7),1.5);mu_b=cv2.GaussianBlur(gb,(7,7),1.5);va=cv2.GaussianBlur(ga*ga,(7,7),1.5)-mu_a*mu_a;vb=cv2.GaussianBlur(gb*gb,(7,7),1.5)-mu_b*mu_b;cov=cv2.GaussianBlur(ga*gb,(7,7),1.5)-mu_a*mu_b
-  ss=((2*mu_a*mu_b+6.5025)*(2*cov+58.5225))/((mu_a*mu_a+mu_b*mu_b+6.5025)*(va+vb+58.5225))
-  return {'canvas_width':width,'foreground_rgb_mae':float(dd[mask].mean()),'foreground_ssim':float(ss[mask].mean()),'changed_foreground_fraction_over_16':float((dd.max(2)[mask]>16).mean())}
- report['viewing_scale_metrics']={label:metrics(width) for label,width in [('normal',512),('medium',1024),('full',2048)]}
- normal=report['viewing_scale_metrics']['normal'];report['passes_normal_threshold']=normal['foreground_rgb_mae']<=profile.get('normal_rgb_mae_limit',1.5) and normal['changed_foreground_fraction_over_16']<=profile.get('normal_changed_fraction_limit',.04)
- image.resize((512,round(size[1]*512/size[0])),Image.Resampling.LANCZOS).save(args.output_dir/(args.name+'_normal.png'))
- report['protected_foreground_rgb_mae']=float(diff[protected&fg].mean()) if np.any(protected&fg) else None
+ fg_mae=float(diff[fg].mean()) if fg.any() else 0.0
+ protected_roi_mae=float(diff[protected].mean()) if protected.any() else None
+ protected_fg_mae=float(diff[protected&fg].mean()) if np.any(protected&fg) else None
+ aa=a.astype(np.float32);bb=b.astype(np.float32);mask=(np.max(np.abs(aa-colors[bg]),2)>20)|(np.max(np.abs(bb-colors[bg]),2)>20);dd=np.abs(aa-bb)
+ ga=cv2.cvtColor(aa,cv2.COLOR_RGB2GRAY);gb=cv2.cvtColor(bb,cv2.COLOR_RGB2GRAY);mu_a=cv2.GaussianBlur(ga,(7,7),1.5);mu_b=cv2.GaussianBlur(gb,(7,7),1.5);va=cv2.GaussianBlur(ga*ga,(7,7),1.5)-mu_a*mu_a;vb=cv2.GaussianBlur(gb*gb,(7,7),1.5)-mu_b*mu_b;cov=cv2.GaussianBlur(ga*gb,(7,7),1.5)-mu_a*mu_b
+ ss=((2*mu_a*mu_b+6.5025)*(2*cov+58.5225))/((mu_a*mu_a+mu_b*mu_b+6.5025)*(va+vb+58.5225))
+ normal={'canvas_width':512,'foreground_rgb_mae':float(dd[mask].mean()) if mask.any() else 0.0,'foreground_ssim':float(ss[mask].mean()) if mask.any() else 1.0,'changed_foreground_fraction_over_16':float((dd.max(2)[mask]>16).mean()) if mask.any() else 0.0}
+ report={'outer_silhouette_symmetric_difference':outer_difference,'outer_tolerance_reference_pixels':profile.get('outer_tolerance',0),'new_deep_internal_gap_area':deep_missing,'excessive_silhouette_spill_area':excessive_spill,'baseline_roles':dict(Counter(o.get('role','') for o in reference)),'baseline_objects':len(reference),'objects':len(objs),'reduction_percent':round(100*(len(reference)-len(objs))/len(reference),2),'lost_foreground_area_working_pixels':missing,'added_foreground_area_working_pixels':spill,'export_max_corner_error_working_pixels':corner_error,'foreground_rgb_mae_0_to_255':fg_mae,'protected_roi_rgb_mae_0_to_255':protected_roi_mae,'max_gd_z':len(objs)-1,'role_counts':dict(Counter(o.get('role','') for o in objs)),'in_game_verified':False,'limitations':'Android memory-safe validation at the normal 512px viewing scale. Geometry/export is unchanged. Offline preview is decoded from GMD but is not the game renderer.','viewing_scale_metrics':{'normal':normal},'mobile_validation_width':512}
+ report['passes_normal_threshold']=normal['foreground_rgb_mae']<=profile.get('normal_rgb_mae_limit',1.5) and normal['changed_foreground_fraction_over_16']<=profile.get('normal_changed_fraction_limit',.04)
+ report['protected_foreground_rgb_mae']=protected_fg_mae
+ image.save(args.output_dir/(args.name+'_normal.png'))
+ del a,b,aa,bb,fg,diff,protected,dd,ga,gb,mu_a,mu_b,va,vb,cov,ss
+ # Keep a crisp 1024px UI preview without retaining a second 2048px baseline.
+ preview=render_at(decoded,1024);preview.save(args.output_dir/(args.name+'_preview.png'));preview.close();image.close();base.close()
  (args.output_dir/(args.name+'_report.json')).write_text(json.dumps(report,indent=2));print(json.dumps(report,indent=2))
 if __name__=='__main__':main()
