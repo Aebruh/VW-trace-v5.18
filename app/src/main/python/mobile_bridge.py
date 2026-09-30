@@ -19,10 +19,11 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+# IMPORTANT: only load the base tracer here. The v5.17/v5.18 optimizer stack is
+# imported lazily after base VW vectorization has completed and its large image
+# arrays have been released. This lowers Android peak RSS during the stage which
+# was being killed on-device.
 import gd_vw_tracer_v5 as v5
-import optimize_v5_17, prune_v5_17, export_validate_v5_17
-import merge_v5_17_fallback
-import optimize_v5_18, prune_v5_18, export_validate_v5_18
 
 try:
     import cv2
@@ -56,7 +57,10 @@ def _stage(work: Path, label: str):
     try:
         rss = _rss_mb()
         text = label if rss is None else f'{label} [RAM {rss} MB]'
-        (work / 'crash_stage.txt').write_text(text, encoding='utf8')
+        stage_file = work / 'crash_stage.txt'
+        stage_file.write_text(text, encoding='utf8')
+        # Let mobile_vectorize update the exact same persistent marker per region.
+        os.environ['GDVW_STAGE_FILE'] = str(stage_file)
     except Exception:
         pass
 
@@ -72,25 +76,26 @@ def _call_main(module, *argv):
 
 def _build_base_scene(png: Path, work: Path):
     _stage(work, 'opening and resizing image')
-    # Avoid keeping the full-resolution decoded source in memory. v5.18 already
-    # traces at a maximum dimension of 512 px, so thumbnail before RGBA conversion.
     with Image.open(png) as opened:
         opened.thumbnail((512, 512), Image.Resampling.LANCZOS)
         source = opened.convert('RGBA')
 
     size = source.size
-    img = source
 
     _stage(work, 'building color palette')
     colors = v5.stable_palette(source, 25)
 
     _stage(work, 'segmenting image')
-    labels, _seeded = v5.edge_aware_labels(img, colors, 4)
+    labels, seeded = v5.edge_aware_labels(source, colors, 4)
     valid = labels[labels >= 0]
     if valid.size == 0:
         raise ValueError('The selected PNG has no visible pixels to trace.')
     background = int(np.bincount(valid, minlength=len(colors)).argmax())
-    del valid
+
+    # The source bitmap, seeded mask and bincount selection are no longer needed
+    # once labels are available. Drop them BEFORE Shapely vectorization starts.
+    del valid, seeded, source
+    gc.collect()
 
     _stage(work, 'vectorizing VW geometry')
     objects, stats = v5.vectorize(
@@ -114,13 +119,18 @@ def _build_base_scene(png: Path, work: Path):
     base_preview.save(work / 'base_preview.png')
     base_count = len(objects)
 
-    # Release the largest base-trace allocations before the optimizer starts.
-    del base_preview, objects, labels, img, source
+    del base_preview, objects, labels
     gc.collect()
     return scene, cache, base_count, stats
 
 
 def _quality(scene: Path, cache: Path, profile_path: Path, out: Path, work: Path):
+    # Lazy import: none of these modules occupy memory during base vectorization.
+    import optimize_v5_17
+    import prune_v5_17
+    import export_validate_v5_17
+    import merge_v5_17_fallback
+
     cfg = json.loads(profile_path.read_text())
     cfg.setdefault('max_visible_error_per_merge', 4)
     cfg.setdefault('max_group_changed_fraction', .04)
@@ -170,6 +180,11 @@ def _quality(scene: Path, cache: Path, profile_path: Path, out: Path, work: Path
 
 
 def _optimized(scene: Path, cache: Path, profile_path: Path, out: Path, tier: str, work: Path):
+    # Lazy import: v5.18 optimizer is only loaded after the base scene exists.
+    import optimize_v5_18
+    import prune_v5_18
+    import export_validate_v5_18
+
     cfg = json.loads(profile_path.read_text())
     fused = out / 'fused.json'
 
@@ -235,6 +250,7 @@ def trace(png_path: str, profile: str = 'balanced', work_dir: str | None = None)
         if work.exists():
             shutil.rmtree(work)
         work.mkdir(parents=True, exist_ok=True)
+        os.environ['GDVW_STAGE_FILE'] = str(work / 'crash_stage.txt')
         _stage(work, 'starting trace')
 
         scene, cache, base_objects, stats = _build_base_scene(Path(png_path), work)
