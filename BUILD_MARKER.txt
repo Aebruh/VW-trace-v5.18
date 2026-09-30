@@ -1,1 +1,1 @@
-Triggers Android APK build for v0.2 crash-fix release (memory-safe profiles and validation).
+Triggers Android APK build for v0.3 streamed-vectorizer crash-fix release.
