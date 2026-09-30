@@ -4,12 +4,15 @@ import android.app.Activity;
 import android.os.Bundle;
 import android.content.Intent;
 import android.net.Uri;
+import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
-import android.view.View;
-import android.widget.*;
 import android.graphics.Color;
+import android.graphics.drawable.BitmapDrawable;
+import android.graphics.drawable.Drawable;
+import android.view.View;
 import android.view.Gravity;
 import android.view.ViewGroup;
+import android.widget.*;
 
 import com.chaquo.python.PyObject;
 import com.chaquo.python.Python;
@@ -44,6 +47,7 @@ public class MainActivity extends Activity {
             Python.start(new AndroidPlatform(this));
         }
         setContentView(buildUi());
+        showPreviousCrashStage();
     }
 
     private View buildUi() {
@@ -61,7 +65,7 @@ public class MainActivity extends Activity {
         root.addView(title);
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("Local PNG → Geometry Dash .gmd tracer");
+        subtitle.setText("Local PNG → Geometry Dash .gmd tracer • Android v0.2");
         subtitle.setTextSize(14);
         subtitle.setTextColor(Color.DKGRAY);
         subtitle.setPadding(0, 0, 0, dp(18));
@@ -156,7 +160,7 @@ public class MainActivity extends Activity {
             if (requestCode == PICK_PNG) {
                 inputFile = new File(getCacheDir(), "input.png");
                 copyUriToFile(uri, inputFile);
-                preview.setImageBitmap(BitmapFactory.decodeFile(inputFile.getAbsolutePath()));
+                setPreviewFile(inputFile, 1024);
                 status.setText("PNG loaded. Choose a profile and tap Trace Locally.");
                 traceButton.setEnabled(true);
                 saveGmdButton.setEnabled(false);
@@ -181,6 +185,11 @@ public class MainActivity extends Activity {
         status.setText("Tracing locally… this can take a while for detailed art.");
         String selected = profile.getSelectedItem().toString().toLowerCase();
         File work = new File(getFilesDir(), "trace_work");
+
+        // Encourage Android to reclaim temporary UI/file-picker allocations before
+        // NumPy/OpenCV/Shapely start allocating tracing buffers.
+        System.gc();
+
         executor.submit(() -> {
             try {
                 Python py = Python.getInstance();
@@ -192,7 +201,7 @@ public class MainActivity extends Activity {
                 int objects = obj.getInt("objects");
                 double reduction = obj.optDouble("reduction_percent", 0.0);
                 runOnUiThread(() -> {
-                    preview.setImageBitmap(BitmapFactory.decodeFile(outputPreview.getAbsolutePath()));
+                    setPreviewFile(outputPreview, 1024);
                     status.setText("Finished: " + objects + " objects • " + selected + " • " + String.format("%.1f%% reduction", reduction));
                     traceButton.setEnabled(true);
                     saveGmdButton.setEnabled(true);
@@ -205,6 +214,46 @@ public class MainActivity extends Activity {
                 });
             }
         });
+    }
+
+    private void setPreviewFile(File file, int maxDimension) {
+        if (file == null || !file.exists()) return;
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(file.getAbsolutePath(), bounds);
+
+        int sample = 1;
+        int largest = Math.max(bounds.outWidth, bounds.outHeight);
+        while (largest / sample > maxDimension * 2) {
+            sample *= 2;
+        }
+
+        BitmapFactory.Options options = new BitmapFactory.Options();
+        options.inSampleSize = Math.max(1, sample);
+        options.inPreferredConfig = Bitmap.Config.ARGB_8888;
+        Bitmap bitmap = BitmapFactory.decodeFile(file.getAbsolutePath(), options);
+        if (bitmap == null) return;
+
+        Drawable old = preview.getDrawable();
+        preview.setImageBitmap(bitmap);
+        if (old instanceof BitmapDrawable) {
+            Bitmap oldBitmap = ((BitmapDrawable) old).getBitmap();
+            if (oldBitmap != null && oldBitmap != bitmap && !oldBitmap.isRecycled()) {
+                oldBitmap.recycle();
+            }
+        }
+    }
+
+    private void showPreviousCrashStage() {
+        File stage = new File(new File(getFilesDir(), "trace_work"), "crash_stage.txt");
+        if (!stage.exists()) return;
+        try (BufferedReader reader = new BufferedReader(new FileReader(stage))) {
+            String line = reader.readLine();
+            if (line != null && !line.startsWith("COMPLETE")) {
+                status.setText("Previous trace stopped during: " + line + ". You can retry; v0.2 uses lower memory.");
+            }
+        } catch (IOException ignored) {
+        }
     }
 
     private void saveFile(File source, String name, String mime, int requestCode) {
