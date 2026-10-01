@@ -1,0 +1,19 @@
+--- src-original/setup.py
++++ src/setup.py
+@@ -77,6 +77,18 @@
+     if include_dir := numpy.get_include():
+         opts["include_dirs"].append(include_dir)
+ 
++    # Chaquopy Android cross-build: the target GEOS wheel is unpacked into
++    # PREFIX by build-wheel.py. Link directly against that copy instead of
++    # invoking a host geos-config executable.
++    prefix = os.environ.get("PREFIX")
++    if prefix:
++        opts["include_dirs"].append(os.path.join(prefix, "include"))
++        opts["library_dirs"].append(os.path.join(prefix, "lib"))
++        opts["libraries"].append("geos_c")
++        return opts
++
+     # Without geos-config (e.g. MSVC), specify these two vars
+     include_dir = os.environ.get("GEOS_INCLUDE_PATH")
+     library_dir = os.environ.get("GEOS_LIBRARY_PATH")
