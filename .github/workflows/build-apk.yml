@@ -63,6 +63,14 @@ jobs:
             tqdm==4.66.1 \
             wheel==0.33.6
 
+      - name: Copy custom wheel recipes into Chaquopy build tree
+        run: |
+          rm -rf .chaquopy-build/server/pypi/packages/gdvw-geos
+          rm -rf .chaquopy-build/server/pypi/packages/gdvw-shapely
+          cp -a android-wheel-recipes/chaquopy-geos .chaquopy-build/server/pypi/packages/gdvw-geos
+          cp -a android-wheel-recipes/shapely .chaquopy-build/server/pypi/packages/gdvw-shapely
+          chmod +x .chaquopy-build/server/pypi/packages/gdvw-geos/build.sh
+
       - name: Download target NumPy wheel for Shapely build
         run: |
           mkdir -p .chaquopy-build/server/pypi/dist/numpy
@@ -72,14 +80,13 @@ jobs:
 
       - name: Build GEOS 3.9.4 for Android arm64
         run: |
-          chmod +x "$GITHUB_WORKSPACE/android-wheel-recipes/chaquopy-geos/build.sh"
           cd .chaquopy-build/server/pypi
-          ./build-wheel.py --abi arm64-v8a "$GITHUB_WORKSPACE/android-wheel-recipes/chaquopy-geos"
+          ./build-wheel.py --abi arm64-v8a packages/gdvw-geos
 
       - name: Build Shapely 2.1.2 for Android arm64
         run: |
           cd .chaquopy-build/server/pypi
-          ./build-wheel.py --python 3.10 --abi arm64-v8a "$GITHUB_WORKSPACE/android-wheel-recipes/shapely"
+          ./build-wheel.py --python 3.10 --abi arm64-v8a packages/gdvw-shapely
 
       - name: Stage custom Android wheels
         run: |
