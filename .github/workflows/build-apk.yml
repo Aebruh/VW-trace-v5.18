@@ -52,10 +52,6 @@ jobs:
           cd .chaquopy-build
           target/download-target.sh maven/com/chaquo/python/target/3.10.19-0
           python -m pip install --upgrade pip
-          # Python 3.10 uses Chaquopy's legacy build-wheel.py. The current
-          # requirements file also contains cibuildwheel 4.x, which is Python
-          # 3.11+ and is only needed for newer Python versions, so install the
-          # legacy builder's actual dependencies explicitly.
           python -m pip install \
             build==1.5.0 \
             jinja2==3.1.6 \
@@ -76,6 +72,7 @@ jobs:
 
       - name: Build GEOS 3.9.4 for Android arm64
         run: |
+          chmod +x "$GITHUB_WORKSPACE/android-wheel-recipes/chaquopy-geos/build.sh"
           cd .chaquopy-build/server/pypi
           ./build-wheel.py --abi arm64-v8a "$GITHUB_WORKSPACE/android-wheel-recipes/chaquopy-geos"
 
