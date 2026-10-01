@@ -3,21 +3,11 @@ _parts = Path(__file__).resolve().parent / "gdvw_core_parts"
 _src = "".join((_parts / f"part{i:02d}.txt").read_text(encoding="utf8") for i in range(5))
 exec(compile(_src, str(_parts / "gd_vw_tracer_v5_core.py"), "exec"), globals(), globals())
 
-# Android-only implementation adapters. The original v5 core above remains
-# byte-for-byte unchanged. These replace only allocation-heavy plumbing while
-# preserving the same VW search, rectangle sizes/angles and scoring.
+# Android-only low-allocation adapter. This keeps the original v5.18 search,
+# sizes, angles and scoring, while avoiding unnecessary temporary geometries.
 try:
     from mobile_geometry_low_alloc import install_android_geometry
     install_android_geometry(globals())
-except Exception:
-    pass
-
-# v0.8: add exact checkpoints around the Shapely calls immediately after the
-# Android inscribed-center helper. This mirrors the original candidate-center
-# logic and changes only diagnostics, not candidate order or scoring.
-try:
-    from mobile_post_center_diag import install_post_center_diagnostics
-    install_post_center_diagnostics(globals())
 except Exception:
     pass
 
