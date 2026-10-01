@@ -1,1 +1,1 @@
-Triggers Android APK build for v0.10 custom Shapely 2.1.2 + GEOS 3.9.4 runtime.
+Triggers Android APK build for v0.10 custom Shapely 2.1.2 + GEOS 3.9.4 runtime, attempt 2.
