@@ -1,0 +1,11 @@
+{% set version = "3.9.4" %}
+
+package:
+  name: chaquopy-geos
+  version: {{ version }}
+
+build:
+  number: 0
+
+source:
+  url: https://download.osgeo.org/geos/geos-{{ version }}.tar.bz2
