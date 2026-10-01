@@ -10,7 +10,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     env:
       ANDROID_HOME: /usr/local/lib/android/sdk
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
@@ -38,15 +38,62 @@ jobs:
       - name: Accept Android SDK licenses
         run: yes | /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
 
-      - name: Install Android SDK 36
+      - name: Install Android SDK 36 and build tools
         run: /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Install native wheel build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y patchelf autoconf automake libtool pkg-config
+
+      - name: Prepare Chaquopy Android wheel builder
+        run: |
+          git clone --depth 1 https://github.com/chaquo/chaquopy.git .chaquopy-build
+          cd .chaquopy-build
+          target/download-target.sh maven/com/chaquo/python/target/3.10.19-0
+          python -m pip install --upgrade pip
+          python -m pip install -r server/pypi/requirements.txt
+
+      - name: Download target NumPy wheel for Shapely build
+        run: |
+          mkdir -p .chaquopy-build/server/pypi/dist/numpy
+          curl -fL \
+            https://chaquo.com/pypi-13.1/numpy/numpy-1.26.2-0-cp310-cp310-android_21_arm64_v8a.whl \
+            -o .chaquopy-build/server/pypi/dist/numpy/numpy-1.26.2-0-cp310-cp310-android_21_arm64_v8a.whl
+
+      - name: Build GEOS 3.9.4 for Android arm64
+        run: |
+          cd .chaquopy-build/server/pypi
+          ./build-wheel.py --abi arm64-v8a "$GITHUB_WORKSPACE/android-wheel-recipes/chaquopy-geos"
+
+      - name: Build Shapely 2.1.2 for Android arm64
+        run: |
+          cd .chaquopy-build/server/pypi
+          ./build-wheel.py --python 3.10 --abi arm64-v8a "$GITHUB_WORKSPACE/android-wheel-recipes/shapely"
+
+      - name: Stage custom Android wheels
+        run: |
+          rm -rf app/wheels
+          mkdir -p app/wheels
+          find .chaquopy-build/server/pypi/dist -type f \( -iname '*geos*.whl' -o -iname 'shapely*.whl' \) -print -exec cp {} app/wheels/ \;
+          echo 'Wheels staged:'
+          ls -lh app/wheels
+          test "$(find app/wheels -maxdepth 1 -iname '*geos*.whl' | wc -l)" -ge 1
+          test "$(find app/wheels -maxdepth 1 -iname 'shapely*.whl' | wc -l)" -ge 1
 
       - name: Build debug APK
         run: gradle :app:assembleDebug --stacktrace
 
+      - name: Upload custom wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: GDVWTracer-v0.10-android-wheels
+          path: app/wheels/*.whl
+          if-no-files-found: error
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: GDVWTracer-v0.9-debug-apk
+          name: GDVWTracer-v0.10-shapely2-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
