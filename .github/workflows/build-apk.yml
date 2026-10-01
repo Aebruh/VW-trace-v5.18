@@ -52,7 +52,20 @@ jobs:
           cd .chaquopy-build
           target/download-target.sh maven/com/chaquo/python/target/3.10.19-0
           python -m pip install --upgrade pip
-          python -m pip install -r server/pypi/requirements.txt
+          # Python 3.10 uses Chaquopy's legacy build-wheel.py. The current
+          # requirements file also contains cibuildwheel 4.x, which is Python
+          # 3.11+ and is only needed for newer Python versions, so install the
+          # legacy builder's actual dependencies explicitly.
+          python -m pip install \
+            build==1.5.0 \
+            jinja2==3.1.6 \
+            jsonschema==2.6.0 \
+            pyelftools==0.29 \
+            pypi-simple==1.1.0 \
+            pyyaml==6.0.3 \
+            setuptools==69.1.1 \
+            tqdm==4.66.1 \
+            wheel==0.33.6
 
       - name: Download target NumPy wheel for Shapely build
         run: |
